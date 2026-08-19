@@ -37,6 +37,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.omnicam.camera.capability.CameraRouteAccess
+import com.omnicam.camera.capability.ValuableCameraResolver
+import com.omnicam.camera.capability.ValuableCameraRoute
 import com.omnicam.camera.capability.toSanitizedJson
 import com.omnicam.core.model.CameraDescriptor
 import com.omnicam.core.model.DeviceCameraProfile
@@ -151,6 +154,10 @@ private fun DiagnosticsContent(
 
         is CameraDiagnosticsUiState.Ready -> {
             val profile = state.profile
+            val resolution = remember(profile) { ValuableCameraResolver.resolve(profile) }
+            val rawCount = profile.cameras.count { it.directlyListed }
+            var showRawRoutes by remember(profile.scannedAtEpochMillis) { mutableStateOf(false) }
+
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(20.dp),
@@ -158,7 +165,7 @@ private fun DiagnosticsContent(
             ) {
                 item {
                     Text(
-                        "OmniCam Snapcam Aux Test",
+                        "OmniCam Useful Camera Resolver",
                         style = MaterialTheme.typography.headlineMedium,
                         fontWeight = FontWeight.Bold,
                     )
@@ -173,26 +180,114 @@ private fun DiagnosticsContent(
                     )
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        "${profile.cameras.count { it.directlyListed }} Camera2 IDs · ${profile.logicalGroups.size} logical multi-camera groups",
+                        "${resolution.valuableRoutes.size} useful cameras · $rawCount raw Camera2 routes · ${profile.logicalGroups.size} logical groups",
                         style = MaterialTheme.typography.titleMedium,
+                    )
+                    Text(
+                        "Rear ${resolution.rearRoutes.size} · Front ${resolution.frontRoutes.size}",
+                        style = MaterialTheme.typography.bodyMedium,
                     )
                     Spacer(Modifier.height(14.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Button(onClick = onOpenLensTest) { Text("Open live lens test") }
+                        Button(onClick = onOpenLensTest) { Text("Open useful lens test") }
                         OutlinedButton(onClick = { onExport(profile) }) { Text("Export JSON") }
                     }
                     Spacer(Modifier.height(8.dp))
-                    OutlinedButton(onClick = onRetry) { Text("Rescan") }
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedButton(onClick = onRetry) { Text("Rescan") }
+                        OutlinedButton(onClick = { showRawRoutes = !showRawRoutes }) {
+                            Text(if (showRawRoutes) "Hide raw routes" else "Show raw routes")
+                        }
+                    }
                 }
-                item { PublicExposureProbeCard(profile) }
-                items(profile.cameras, key = { it.id }) { camera -> CameraCard(camera) }
+
+                item { UsefulResolutionCard(profile, resolution.valuableRoutes, resolution.excludedRoutes.size) }
+                items(resolution.valuableRoutes, key = { "useful-${it.camera.id}" }) { route ->
+                    ValuableCameraCard(route)
+                }
+
+                if (showRawRoutes) {
+                    item { PublicExposureProbeCard(profile) }
+                    item {
+                        Text(
+                            "Raw Camera2 graph · developer diagnostics",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    items(profile.cameras, key = { "raw-${it.id}" }) { camera -> CameraCard(camera) }
+                }
+
                 item {
                     Text(
-                        "This is an isolated diagnostic identity experiment. Do not use the package identity as OmniCam's production package. Live preview/capture probes validate which exposed IDs CameraX can actually bind.",
+                        "Normal UI uses only resolved useful camera routes. Logical aggregators and strong duplicate aliases remain available in raw diagnostics, not as extra user lenses.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun UsefulResolutionCard(
+    profile: DeviceCameraProfile,
+    routes: List<ValuableCameraRoute>,
+    excludedCount: Int,
+) {
+    val directCount = routes.count { it.access == CameraRouteAccess.DIRECT_CAMERA_DEVICE }
+    val logicalPhysicalCount = routes.count { it.access == CameraRouteAccess.PHYSICAL_VIA_LOGICAL }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+    ) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Resolved user cameras", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("${routes.size} useful routes · $directCount direct · $logicalPhysicalCount physical-via-logical")
+            Text("$excludedCount raw routes hidden from normal lens UI")
+            Text(
+                "The resolver is capability/metadata-driven; no ${profile.model}-specific camera ID table is used.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ValuableCameraCard(route: ValuableCameraRoute) {
+    val camera = route.camera
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+    ) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Camera ${camera.id}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                Text(camera.classification.role.name.replace('_', ' '), style = MaterialTheme.typography.labelLarge)
+            }
+            val access = when (route.access) {
+                CameraRouteAccess.DIRECT_CAMERA_DEVICE -> "Direct Camera2 device"
+                CameraRouteAccess.PHYSICAL_VIA_LOGICAL ->
+                    "Physical via logical ${route.logicalCameraIds.joinToString()}"
+            }
+            Text(access, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+            camera.equivalentFocalLengthsMm.takeIf { it.isNotEmpty() }?.let { values ->
+                Text("35mm eq: ${values.joinToString { String.format(Locale.US, "%.1f mm", it) }}")
+            }
+            camera.focalLengthsMm.takeIf { it.isNotEmpty() }?.let { values ->
+                Text("Native focal: ${values.joinToString { String.format(Locale.US, "%.2f mm", it) }}")
+            }
+            Text(
+                listOfNotNull(
+                    "RAW".takeIf { camera.rawSupported },
+                    "Manual".takeIf { camera.manualSensorSupported },
+                    "Burst".takeIf { camera.burstCaptureSupported },
+                    "OIS".takeIf { camera.opticalStabilizationAvailable },
+                    "Flash".takeIf { camera.flashAvailable },
+                ).ifEmpty { listOf("Standard photographic route") }.joinToString(" · "),
+            )
         }
     }
 }
@@ -222,7 +317,7 @@ private fun PublicExposureProbeCard(profile: DeviceCameraProfile) {
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
     ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Snapcam identity exposure probe", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("Raw Snapcam identity exposure probe", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text("Package: ${profile.clientPackageName}", style = MaterialTheme.typography.bodySmall)
             Text("Camera2 IDs: $camera2Count · Camera1 devices: $legacyCount · logical groups: ${profile.logicalGroups.size}")
             if (profile.legacyCameras.isNotEmpty()) {
@@ -261,7 +356,7 @@ private fun CameraCard(camera: CameraDescriptor) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text(
-                    "Camera ${camera.id}",
+                    "Raw Camera ${camera.id}",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.SemiBold,
                 )
@@ -295,7 +390,7 @@ private fun CameraCard(camera: CameraDescriptor) {
             )
             if (!camera.directlyListed) {
                 Text(
-                    "Physical member; not directly listed as an openable camera ID",
+                    "Physical member; not directly listed as an independent camera ID",
                     style = MaterialTheme.typography.labelMedium,
                 )
             }
