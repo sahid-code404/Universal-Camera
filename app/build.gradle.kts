@@ -15,8 +15,8 @@ android {
         applicationId = "org.codeaurora.snapcam"
         minSdk = 28
         targetSdk = 37
-        versionCode = 9001
-        versionName = "0.1.0-snapcam-aux-probe"
+        versionCode = 9002
+        versionName = "0.1.0-snapcam-live-lens-test"
     }
 
     buildFeatures {
@@ -38,6 +38,7 @@ android {
 
 dependencies {
     implementation(project(":camera-capability"))
+    implementation(project(":camera-camerax"))
     implementation(project(":feature-camera"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
