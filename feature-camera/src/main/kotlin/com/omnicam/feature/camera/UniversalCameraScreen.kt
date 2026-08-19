@@ -206,6 +206,9 @@ fun UniversalCameraRoute(
     }
 
     val selectedRoute = visibleRoutes.firstOrNull { it.camera.id == selectedId }
+    val selectedUpscalingEnabled = selectedRoute?.let {
+        preferences.isUpscalingEnabled(it.camera.id)
+    } == true
 
     LaunchedEffect(selectedRoute?.camera?.id) {
         val camera = selectedRoute?.camera
@@ -241,6 +244,7 @@ fun UniversalCameraRoute(
         aspect,
         preferences.photoFormat,
         preferences.photoQuality,
+        selectedUpscalingEnabled,
         lifecycleResumed,
     ) {
         controller.unbind()
@@ -256,11 +260,12 @@ fun UniversalCameraRoute(
             viewfinderSpec = null
             return@LaunchedEffect
         }
+        controller.setAdaptiveUpscalingEnabled(selectedUpscalingEnabled)
         viewfinderSpec = runCatching {
             controller.createViewfinderSpec(
                 route = route,
                 aspectRatio = aspect,
-                sessionKey = "${preferences.photoFormat.name}:${preferences.photoQuality}",
+                sessionKey = "${preferences.photoFormat.name}:${preferences.photoQuality}:upscale=$selectedUpscalingEnabled",
             )
         }.onFailure { error ->
             bindResult = CameraBindResult.Failure(
@@ -307,6 +312,7 @@ fun UniversalCameraRoute(
                 capturing = capturing,
                 latestPhoto = latestPhoto,
                 photoFormat = preferences.photoFormat,
+                upscalingEnabled = selectedUpscalingEnabled,
                 lifecycleResumed = lifecycleResumed,
                 onSurfaceAvailable = { surface ->
                     val spec = viewfinderSpec
@@ -314,6 +320,9 @@ fun UniversalCameraRoute(
                     if (spec == null || route == null || !lifecycleResumed) return@CameraView
                     bindResult = null
                     controller.setFlashMode(flash)
+                    controller.setAdaptiveUpscalingEnabled(
+                        preferences.isUpscalingEnabled(route.camera.id),
+                    )
                     val result = controller.bind(
                         surface = surface,
                         spec = spec,
@@ -462,6 +471,9 @@ fun UniversalCameraRoute(
             preferences = preferences,
             onDismiss = { lensManagerOpen = false },
             onToggle = { id, enabled -> scope.launch { preferencesStore.setEnabled(id, enabled) } },
+            onUpscale = { id, enabled ->
+                scope.launch { preferencesStore.setUpscalingEnabled(id, enabled) }
+            },
             onMove = { face, id, delta ->
                 val ordered = preferences.applyOrder(
                     resolution.valuableRoutes.filter { it.camera.lensFacing == face },
@@ -502,6 +514,7 @@ private fun CameraView(
     capturing: Boolean,
     latestPhoto: Uri?,
     photoFormat: PhotoOutputFormat,
+    upscalingEnabled: Boolean,
     lifecycleResumed: Boolean,
     onSurfaceAvailable: suspend (android.view.Surface) -> Unit,
     onTapFocus: (Offset, Size) -> Unit,
@@ -679,6 +692,9 @@ private fun CameraView(
                     append(aspect.label)
                     append(" · ")
                     append(photoFormat.name)
+                    if (upscalingEnabled && photoFormat != PhotoOutputFormat.DNG) {
+                        append(" · 2× ADAPTIVE")
+                    }
                 },
                 color = Color.White.copy(alpha = 0.82f),
                 style = MaterialTheme.typography.labelLarge,
@@ -779,7 +795,7 @@ private fun CaptureStatus(result: PhotoCaptureResult?) {
         is PhotoCaptureResult.Failure -> result.message
         is PhotoCaptureResult.Success -> {
             val resolution = formatResolution(result.width, result.height)
-            when {
+            val base = when {
                 result.usedFormatFallback ->
                     "${result.requestedFormat.name} unavailable; saved ${result.actualFormat.name} · $resolution"
                 result.actualFormat == PhotoOutputFormat.DNG ->
@@ -792,6 +808,15 @@ private fun CaptureStatus(result: PhotoCaptureResult?) {
                     "Saved native Camera2 HEIF · $resolution"
                 else -> "Saved ${result.actualFormat.name} · $resolution"
             }
+            val enhancement = when {
+                result.upscaled -> {
+                    val source = formatResolution(result.sourceWidth, result.sourceHeight)
+                    " · 2× upscale from $source"
+                }
+                result.usedMaximumResolutionMode -> " · maximum-resolution sensor mode"
+                else -> ""
+            }
+            base + enhancement
         }
         null -> null
     } ?: return
@@ -974,8 +999,13 @@ private fun SettingsSheet(
 
             Spacer(Modifier.height(18.dp))
             Button(onClick = onLenses, modifier = Modifier.fillMaxWidth()) {
-                Text("Manage lenses")
+                Text("Manage lenses & upscaling")
             }
+            Text(
+                "Adaptive 2× upscaling can be enabled or disabled separately for every lens. It only enlarges eligible low-resolution processed streams; RAW/DNG always stays native.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             TextButton(onClick = onDiagnostics, modifier = Modifier.fillMaxWidth()) {
                 Text("Camera diagnostics")
             }
@@ -1101,22 +1131,23 @@ private fun LensManagerSheet(
     preferences: LensPreferences,
     onDismiss: () -> Unit,
     onToggle: (String, Boolean) -> Unit,
+    onUpscale: (String, Boolean) -> Unit,
     onMove: (LensFacing, String, Int) -> Unit,
     onReset: () -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
             Text(
-                "Lens layout",
+                "Lens layout & upscaling",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
             )
             Text(
-                "Enable useful lenses and choose their order. Logical/vendor duplicate routes stay hidden.",
+                "Each photographic lens keeps its own visibility, order and adaptive 2× upscale preference. Logical/vendor duplicate routes stay hidden.",
                 style = MaterialTheme.typography.bodySmall,
             )
             Spacer(Modifier.height(10.dp))
-            LazyColumn(Modifier.fillMaxWidth().height(420.dp)) {
+            LazyColumn(Modifier.fillMaxWidth().height(470.dp)) {
                 listOf(LensFacing.BACK, LensFacing.FRONT).forEach { face ->
                     val ordered = preferences.applyOrder(
                         routes.filter { it.camera.lensFacing == face },
@@ -1133,32 +1164,59 @@ private fun LensManagerSheet(
                         items(ordered, key = { "$face-${it.camera.id}" }) { item ->
                             val index = ordered.indexOfFirst { it.camera.id == item.camera.id }
                             val enabled = preferences.isEnabled(item.camera.id)
+                            val upscaleEnabled = preferences.isUpscalingEnabled(item.camera.id)
                             val enabledCount = ordered.count { preferences.isEnabled(it.camera.id) }
-                            Row(
+                            Column(
                                 Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Column(Modifier.width(185.dp)) {
-                                    Text(lensManagerTitle(item), fontWeight = FontWeight.SemiBold)
-                                    Text(
-                                        lensManagerSubtitle(item),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.width(185.dp)) {
+                                        Text(lensManagerTitle(item), fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            lensManagerSubtitle(item),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    TextButton(
+                                        enabled = index > 0,
+                                        onClick = { onMove(face, item.camera.id, -1) },
+                                    ) { Text("Up") }
+                                    TextButton(
+                                        enabled = index < ordered.lastIndex,
+                                        onClick = { onMove(face, item.camera.id, 1) },
+                                    ) { Text("Down") }
+                                    Switch(
+                                        checked = enabled,
+                                        enabled = !(enabled && enabledCount <= 1),
+                                        onCheckedChange = { onToggle(item.camera.id, it) },
                                     )
                                 }
-                                TextButton(
-                                    enabled = index > 0,
-                                    onClick = { onMove(face, item.camera.id, -1) },
-                                ) { Text("Up") }
-                                TextButton(
-                                    enabled = index < ordered.lastIndex,
-                                    onClick = { onMove(face, item.camera.id, 1) },
-                                ) { Text("Down") }
-                                Switch(
-                                    checked = enabled,
-                                    enabled = !(enabled && enabledCount <= 1),
-                                    onCheckedChange = { onToggle(item.camera.id, it) },
-                                )
+                                Row(
+                                    Modifier.fillMaxWidth().padding(top = 4.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.width(270.dp)) {
+                                        Text("Adaptive 2× upscale", fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            if (upscaleEnabled) {
+                                                "Enabled for this lens when its processed source is ≤5 MP. RAW/DNG stays native."
+                                            } else {
+                                                "Disabled for this lens; save its native processed resolution."
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    Switch(
+                                        checked = upscaleEnabled,
+                                        onCheckedChange = { onUpscale(item.camera.id, it) },
+                                    )
+                                }
                             }
                             HorizontalDivider()
                         }
