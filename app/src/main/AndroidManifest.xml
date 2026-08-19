@@ -5,13 +5,13 @@
     <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
 
     <application
-        android:name=".OmniCamApplication"
+        android:name="com.omnicam.app.OmniCamApplication"
         android:allowBackup="true"
-        android:label="OmniCam"
+        android:label="OmniCam Aux Identity Test"
         android:supportsRtl="true"
         android:theme="@style/Theme.OmniCam">
         <activity
-            android:name=".MainActivity"
+            android:name="com.omnicam.app.MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

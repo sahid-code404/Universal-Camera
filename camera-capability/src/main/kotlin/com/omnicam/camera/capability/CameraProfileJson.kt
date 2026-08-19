@@ -11,8 +11,10 @@ fun DeviceCameraProfile.toSanitizedJson(): String {
         .put("manufacturer", manufacturer)
         .put("model", model)
         .put("sdkInt", sdkInt)
+        .put("clientPackageName", clientPackageName)
         .put("scannedAtEpochMillis", scannedAtEpochMillis)
         .put("publicExposureAssessment", publicExposureAssessment.name)
+        .put("numericCameraIdProbeReadableIds", JSONArray(numericCameraIdProbeReadableIds))
         .put(
             "legacyCameraApi",
             JSONObject()

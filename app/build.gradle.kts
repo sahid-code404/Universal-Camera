@@ -8,11 +8,15 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.omnicam.app"
+        // TEMPORARY DIAGNOSTIC IDENTITY ONLY.
+        // Some Qualcomm/Xiaomi camera providers historically expose auxiliary
+        // cameras only to allowlisted client package names such as this one.
+        // Do not merge this applicationId into OmniCam production.
+        applicationId = "org.codeaurora.snapcam"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0-dev"
+        versionCode = 9001
+        versionName = "0.1.0-snapcam-aux-probe"
     }
 
     buildFeatures {

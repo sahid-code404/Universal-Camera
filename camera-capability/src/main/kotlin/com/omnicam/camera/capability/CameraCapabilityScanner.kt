@@ -31,7 +31,8 @@ interface CameraCapabilityScanner {
 class AndroidCameraCapabilityScanner(
     context: Context,
 ) : CameraCapabilityScanner {
-    private val cameraManager = context.applicationContext.getSystemService(CameraManager::class.java)
+    private val appContext = context.applicationContext
+    private val cameraManager = appContext.getSystemService(CameraManager::class.java)
 
     override suspend fun scan(): DeviceCameraProfile = withContext(Dispatchers.Default) {
         val listedIds = cameraManager.cameraIdList.toList()
@@ -74,11 +75,13 @@ class AndroidCameraCapabilityScanner(
 
         val legacyProbe = readLegacyCameraProbe()
         val concurrentIds = readConcurrentCameraIdSets()
+        val numericProbeReadableIds = readNumericCameraIdProbe(listedIds)
         val assessment = assessPublicCameraExposure(
             listedIds = listedIds,
             descriptors = descriptors,
             logicalGroups = logicalGroups,
             legacyCameraCount = legacyProbe.count,
+            numericProbeReadableIds = numericProbeReadableIds,
         )
 
         DeviceCameraProfile(
@@ -88,9 +91,11 @@ class AndroidCameraCapabilityScanner(
             scannedAtEpochMillis = System.currentTimeMillis(),
             cameras = descriptors,
             logicalGroups = logicalGroups,
+            clientPackageName = appContext.packageName,
             legacyCameraCount = legacyProbe.count,
             legacyCameras = legacyProbe.cameras,
             concurrentCameraIdSets = concurrentIds,
+            numericCameraIdProbeReadableIds = numericProbeReadableIds,
             publicExposureAssessment = assessment,
         )
     }
@@ -217,11 +222,24 @@ class AndroidCameraCapabilityScanner(
         }.getOrDefault(emptyList())
     }
 
+    /**
+     * Experimental diagnostic only. Some older vendor stacks historically used
+     * numeric camera IDs and filtered the enumerated list by caller identity.
+     * Reading characteristics does not open a camera. We never use guessed IDs
+     * for production routing and never claim these are independently openable.
+     */
+    private fun readNumericCameraIdProbe(listedIds: List<String>): List<String> =
+        (0..9)
+            .map(Int::toString)
+            .filterNot { it in listedIds }
+            .filter { readCharacteristicsSafely(it) != null }
+
     private fun assessPublicCameraExposure(
         listedIds: List<String>,
         descriptors: List<CameraDescriptor>,
         logicalGroups: List<LogicalCameraGroup>,
         legacyCameraCount: Int?,
+        numericProbeReadableIds: List<String>,
     ): PublicCameraExposureAssessment {
         if (logicalGroups.isNotEmpty()) {
             return PublicCameraExposureAssessment.LOGICAL_MULTI_CAMERA_EXPOSED
@@ -235,6 +253,10 @@ class AndroidCameraCapabilityScanner(
 
         if (legacyCameraCount != null && legacyCameraCount > listedIds.size) {
             return PublicCameraExposureAssessment.LEGACY_API_SEES_ADDITIONAL_CAMERAS
+        }
+
+        if (numericProbeReadableIds.isNotEmpty()) {
+            return PublicCameraExposureAssessment.UNLISTED_NUMERIC_CAMERA_CHARACTERISTICS_READABLE
         }
 
         if (listedIds.isNotEmpty() && logicalGroups.isEmpty() && (legacyCameraCount == null || legacyCameraCount <= listedIds.size)) {

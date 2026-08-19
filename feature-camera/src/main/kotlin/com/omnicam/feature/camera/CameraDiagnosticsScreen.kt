@@ -88,7 +88,7 @@ fun CameraDiagnosticsRoute(
                 onRetry = { viewModel.scan(force = true) },
                 onExport = { profile ->
                     pendingExport = profile.toSanitizedJson()
-                    exportLauncher.launch("omnicam-device-report.json")
+                    exportLauncher.launch("omnicam-snapcam-aux-identity-report.json")
                 },
             )
         }
@@ -104,10 +104,10 @@ private fun PermissionContent(onRequestPermission: () -> Unit) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("OmniCam", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.SemiBold)
+        Text("OmniCam Aux Identity Test", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(12.dp))
         Text(
-            "Camera permission is needed to inspect the camera hardware that Android exposes to this app. No photos are uploaded.",
+            "Temporary diagnostic build using a Snapcam-compatible package identity to test vendor auxiliary-camera filtering. No photos are uploaded.",
             style = MaterialTheme.typography.bodyLarge,
         )
         Spacer(Modifier.height(24.dp))
@@ -155,13 +155,18 @@ private fun DiagnosticsContent(
             ) {
                 item {
                     Text(
-                        "OmniCam Camera Diagnostics",
+                        "OmniCam Snapcam Aux Test",
                         style = MaterialTheme.typography.headlineMedium,
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
                         "${profile.manufacturer} ${profile.model} · Android API ${profile.sdkInt}",
                         style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Text(
+                        "Client package: ${profile.clientPackageName}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
                     )
                     Spacer(Modifier.height(10.dp))
                     Text(
@@ -178,7 +183,7 @@ private fun DiagnosticsContent(
                 items(profile.cameras, key = { it.id }) { camera -> CameraCard(camera) }
                 item {
                     Text(
-                        "Physical members that are not directly listed are shown for diagnostics only. Their presence does not imply that Android allows them to be opened independently.",
+                        "This is an isolated diagnostic identity experiment. Do not use the package identity as OmniCam's production package. Physical or guessed IDs are not considered capture-capable until a later opening/session test proves it.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
@@ -193,15 +198,17 @@ private fun PublicExposureProbeCard(profile: DeviceCameraProfile) {
     val legacyCount = profile.legacyCameraCount?.toString() ?: "unavailable"
     val assessmentText = when (profile.publicExposureAssessment) {
         PublicCameraExposureAssessment.MULTIPLE_CAMERA2_IDS ->
-            "Android Camera2 exposes multiple cameras on at least one side. Auxiliary routing can be tested directly."
+            "The Snapcam client identity exposes multiple Camera2 devices on at least one side. This strongly supports vendor package filtering as the reason the normal OmniCam identity saw fewer cameras."
         PublicCameraExposureAssessment.LOGICAL_MULTI_CAMERA_EXPOSED ->
-            "Android exposes a logical multi-camera group. Its physical members can be investigated through public logical/physical camera APIs."
+            "The Snapcam client identity exposes a logical multi-camera group. Its physical members can be tested through public logical/physical camera APIs."
         PublicCameraExposureAssessment.LEGACY_API_SEES_ADDITIONAL_CAMERAS ->
-            "The legacy Camera1 API sees more camera devices than Camera2. This is an important vendor-specific public-API path to test next."
+            "Camera1 sees more devices than Camera2 under this identity. A vendor-specific legacy capture test is warranted."
+        PublicCameraExposureAssessment.UNLISTED_NUMERIC_CAMERA_CHARACTERISTICS_READABLE ->
+            "At least one unlisted numeric Camera2 ID returned characteristics. This is diagnostic-only evidence of a vendor filtering quirk; it is not yet proof that the camera can be opened."
         PublicCameraExposureAssessment.AUXILIARY_NOT_EXPOSED_BY_STANDARD_DISCOVERY ->
-            "No additional auxiliary camera is exposed by standard Camera2 or Camera1 enumeration. The ROM/HAL is likely restricting those sensors to OEM or privileged camera software."
+            "Even the Snapcam client identity did not expose additional cameras through Camera2 or Camera1 enumeration. Package-name allowlisting alone is not sufficient on this ROM."
         PublicCameraExposureAssessment.UNKNOWN ->
-            "The public API exposure result is inconclusive."
+            "The auxiliary exposure result is inconclusive."
     }
 
     Card(
@@ -210,7 +217,8 @@ private fun PublicExposureProbeCard(profile: DeviceCameraProfile) {
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
     ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Public API exposure probe", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("Snapcam identity exposure probe", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("Package: ${profile.clientPackageName}", style = MaterialTheme.typography.bodySmall)
             Text("Camera2 IDs: $camera2Count · Camera1 devices: $legacyCount · logical groups: ${profile.logicalGroups.size}")
             if (profile.legacyCameras.isNotEmpty()) {
                 Text(
@@ -218,6 +226,13 @@ private fun PublicExposureProbeCard(profile: DeviceCameraProfile) {
                         "#${camera.index} ${camera.lensFacing} ${camera.orientationDegrees}°"
                     },
                     style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            if (profile.numericCameraIdProbeReadableIds.isNotEmpty()) {
+                Text(
+                    "Readable unlisted numeric Camera2 IDs: ${profile.numericCameraIdProbeReadableIds.joinToString()}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
                 )
             }
             if (profile.concurrentCameraIdSets.isNotEmpty()) {

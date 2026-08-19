@@ -96,20 +96,23 @@ enum class PublicCameraExposureAssessment {
     MULTIPLE_CAMERA2_IDS,
     LOGICAL_MULTI_CAMERA_EXPOSED,
     LEGACY_API_SEES_ADDITIONAL_CAMERAS,
+    UNLISTED_NUMERIC_CAMERA_CHARACTERISTICS_READABLE,
     AUXILIARY_NOT_EXPOSED_BY_STANDARD_DISCOVERY,
     UNKNOWN,
 }
 
 data class DeviceCameraProfile(
-    val schemaVersion: Int = 2,
+    val schemaVersion: Int = 3,
     val manufacturer: String,
     val model: String,
     val sdkInt: Int,
     val scannedAtEpochMillis: Long,
     val cameras: List<CameraDescriptor>,
     val logicalGroups: List<LogicalCameraGroup>,
+    val clientPackageName: String = "",
     val legacyCameraCount: Int? = null,
     val legacyCameras: List<LegacyCameraDescriptor> = emptyList(),
     val concurrentCameraIdSets: List<List<String>> = emptyList(),
+    val numericCameraIdProbeReadableIds: List<String> = emptyList(),
     val publicExposureAssessment: PublicCameraExposureAssessment = PublicCameraExposureAssessment.UNKNOWN,
 )
