@@ -9,10 +9,12 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.util.Size
 import android.view.Surface
-import android.view.TextureView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.viewfinder.compose.MutableCoordinateTransformer
+import androidx.camera.viewfinder.compose.Viewfinder
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -68,10 +70,10 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -80,6 +82,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.omnicam.camera.camerax.Camera2PhotoController
 import com.omnicam.camera.camerax.CameraBindResult
 import com.omnicam.camera.camerax.CameraFlashMode
+import com.omnicam.camera.camerax.CameraViewfinderSpec
 import com.omnicam.camera.camerax.HeifEncodingPath
 import com.omnicam.camera.camerax.PhotoAspectRatio
 import com.omnicam.camera.camerax.PhotoCaptureResult
@@ -98,6 +101,7 @@ import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -111,10 +115,10 @@ fun UniversalCameraRoute(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    val hostView = LocalView.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val haptics = LocalHapticFeedback.current
-    val textureView = remember(context) { TextureView(context) }
     val preferences by preferencesStore.preferences.collectAsStateWithLifecycle(LensPreferences())
 
     var permissionsGranted by remember { mutableStateOf(cameraPermissionsGranted(context)) }
@@ -131,7 +135,6 @@ fun UniversalCameraRoute(
     var bindResult by remember { mutableStateOf<CameraBindResult?>(null) }
     var captureResult by remember { mutableStateOf<PhotoCaptureResult?>(null) }
     var capturing by remember { mutableStateOf(false) }
-    var focusPoint by remember { mutableStateOf<Offset?>(null) }
     var latestPhoto by remember { mutableStateOf<Uri?>(null) }
     var settingsOpen by remember { mutableStateOf(false) }
     var lensManagerOpen by remember { mutableStateOf(false) }
@@ -140,6 +143,7 @@ fun UniversalCameraRoute(
     var manualIso by remember { mutableStateOf(100) }
     var manualExposureNs by remember { mutableStateOf(16_666_667L) }
     var manualFocusDiopters by remember { mutableFloatStateOf(0f) }
+    var viewfinderSpec by remember { mutableStateOf<CameraViewfinderSpec?>(null) }
     var lifecycleResumed by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
     }
@@ -239,52 +243,34 @@ fun UniversalCameraRoute(
         preferences.photoQuality,
         lifecycleResumed,
     ) {
-        if (!lifecycleResumed) {
-            controller.unbind()
-            bindResult = null
-            return@LaunchedEffect
-        }
-        val route = selectedRoute ?: run {
-            controller.unbind()
-            bindResult = null
-            return@LaunchedEffect
-        }
-
+        controller.unbind()
         bindResult = null
         captureResult = null
         zoom = 1f
         exposure = 0f
-        controller.setFlashMode(flash)
-        bindResult = controller.bind(
-            textureView = textureView,
-            route = route,
-            aspectRatio = aspect,
-            outputFormat = preferences.photoFormat,
-            quality = preferences.photoQuality,
-        )
-        (bindResult as? CameraBindResult.Success)?.let { success ->
-            minZoom = success.minZoomRatio
-            maxZoom = success.maxZoomRatio
-            zoom = 1f.coerceIn(minZoom, maxZoom)
-            controller.setZoomRatio(zoom)
+        if (!lifecycleResumed) {
+            viewfinderSpec = null
+            return@LaunchedEffect
         }
-        controller.setProControls(
-            ProControls(
-                enabled = proEnabled && route.camera.manualSensorSupported,
-                iso = manualIso,
-                exposureTimeNs = manualExposureNs,
-                focusDistanceDiopters = manualFocusDiopters,
-            ),
-        )
+        val route = selectedRoute ?: run {
+            viewfinderSpec = null
+            return@LaunchedEffect
+        }
+        viewfinderSpec = runCatching {
+            controller.createViewfinderSpec(
+                route = route,
+                aspectRatio = aspect,
+                sessionKey = "${preferences.photoFormat.name}:${preferences.photoQuality}",
+            )
+        }.onFailure { error ->
+            bindResult = CameraBindResult.Failure(
+                cameraId = route.camera.id,
+                reason = error.message ?: error::class.java.simpleName,
+            )
+        }.getOrNull()
     }
 
     LaunchedEffect(flash) { controller.setFlashMode(flash) }
-    LaunchedEffect(focusPoint) {
-        if (focusPoint != null) {
-            delay(1_000)
-            focusPoint = null
-        }
-    }
 
     DisposableEffect(Unit) {
         onDispose { controller.unbind() }
@@ -304,8 +290,8 @@ fun UniversalCameraRoute(
                 contentAlignment = Alignment.Center,
             ) { CircularProgressIndicator() }
             else -> CameraView(
-                textureView = textureView,
                 controller = controller,
+                viewfinderSpec = viewfinderSpec,
                 route = selectedRoute,
                 routes = visibleRoutes,
                 facing = facing,
@@ -319,14 +305,46 @@ fun UniversalCameraRoute(
                 bindResult = bindResult,
                 captureResult = captureResult,
                 capturing = capturing,
-                focusPoint = focusPoint,
                 latestPhoto = latestPhoto,
                 photoFormat = preferences.photoFormat,
-                onTapFocus = { point, width, height ->
-                    focusPoint = point
-                    if (width > 0f && height > 0f) {
-                        controller.focusAt(point.x / width, point.y / height)
+                lifecycleResumed = lifecycleResumed,
+                onSurfaceAvailable = { surface ->
+                    val spec = viewfinderSpec
+                    val route = selectedRoute
+                    if (spec == null || route == null || !lifecycleResumed) return@CameraView
+                    bindResult = null
+                    controller.setFlashMode(flash)
+                    val result = controller.bind(
+                        surface = surface,
+                        spec = spec,
+                        route = route,
+                        aspectRatio = aspect,
+                        outputFormat = preferences.photoFormat,
+                        quality = preferences.photoQuality,
+                    )
+                    bindResult = result
+                    (result as? CameraBindResult.Success)?.let { success ->
+                        minZoom = success.minZoomRatio
+                        maxZoom = success.maxZoomRatio
+                        zoom = 1f.coerceIn(minZoom, maxZoom)
+                        controller.setZoomRatio(zoom)
                     }
+                    controller.setProControls(
+                        ProControls(
+                            enabled = proEnabled && route.camera.manualSensorSupported,
+                            iso = manualIso,
+                            exposureTimeNs = manualExposureNs,
+                            focusDistanceDiopters = manualFocusDiopters,
+                        ),
+                    )
+                },
+                onTapFocus = { sourcePoint, sourceSize ->
+                    controller.focusAtSurface(
+                        sourceX = sourcePoint.x,
+                        sourceY = sourcePoint.y,
+                        sourceWidth = sourceSize.width,
+                        sourceHeight = sourceSize.height,
+                    )
                 },
                 onZoom = { requested ->
                     zoom = requested.coerceIn(minZoom, maxZoom)
@@ -362,7 +380,7 @@ fun UniversalCameraRoute(
                         )
                         scope.launch {
                             val immediate = controller.capturePhoto(
-                                displayRotationDegrees(textureView),
+                                displayRotationDegrees(hostView.display?.rotation ?: Surface.ROTATION_0),
                             ) { finalized ->
                                 captureResult = finalized
                                 (finalized as? PhotoCaptureResult.Success)?.let {
@@ -467,8 +485,8 @@ fun UniversalCameraRoute(
 
 @Composable
 private fun CameraView(
-    textureView: TextureView,
     controller: Camera2PhotoController,
+    viewfinderSpec: CameraViewfinderSpec?,
     route: ValuableCameraRoute?,
     routes: List<ValuableCameraRoute>,
     facing: LensFacing,
@@ -482,10 +500,11 @@ private fun CameraView(
     bindResult: CameraBindResult?,
     captureResult: PhotoCaptureResult?,
     capturing: Boolean,
-    focusPoint: Offset?,
     latestPhoto: Uri?,
     photoFormat: PhotoOutputFormat,
-    onTapFocus: (Offset, Float, Float) -> Unit,
+    lifecycleResumed: Boolean,
+    onSurfaceAvailable: suspend (android.view.Surface) -> Unit,
+    onTapFocus: (Offset, Size) -> Unit,
     onZoom: (Float) -> Unit,
     onExposure: (Float) -> Unit,
     onFlash: () -> Unit,
@@ -499,44 +518,90 @@ private fun CameraView(
 ) {
     val mainEq = chooseDefaultRoute(routes)?.camera?.equivalentFocalLengthsMm?.minOrNull()
     val exposureRange = route?.camera?.aeCompensationRange ?: 0..0
+    val coordinateTransformer = remember(viewfinderSpec?.surfaceRequest?.requestId) {
+        MutableCoordinateTransformer()
+    }
+    var focusPoint by remember(viewfinderSpec?.surfaceRequest?.requestId) {
+        mutableStateOf<Offset?>(null)
+    }
 
-    BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
-        val landscape = maxWidth > maxHeight
-        val previewAspect = if (landscape) {
-            aspect.width.toFloat() / aspect.height.toFloat()
-        } else {
-            aspect.height.toFloat() / aspect.width.toFloat()
+    LaunchedEffect(focusPoint) {
+        if (focusPoint != null) {
+            delay(1_000)
+            focusPoint = null
         }
-        val parentAspect = if (maxHeight.value > 0f) maxWidth.value / maxHeight.value else previewAspect
-        val previewModifier = if (previewAspect >= parentAspect) {
-            Modifier.fillMaxWidth().aspectRatio(previewAspect)
-        } else {
-            Modifier.fillMaxHeight().aspectRatio(previewAspect)
-        }
+    }
 
-        AndroidView(
-            factory = { textureView },
-            update = { controller.updatePreviewTransform(it) },
-            modifier = previewModifier
-                .align(Alignment.Center)
-                .pointerInput(route?.camera?.id, zoom) {
-                    detectTransformGestures { _, _, scale, _ ->
-                        if (scale != 1f) onZoom(zoom * scale)
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        PreviewViewport(
+            aspect = aspect,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = 88.dp, bottom = 225.dp),
+        ) {
+            val spec = viewfinderSpec
+            if (spec != null && lifecycleResumed) {
+                Viewfinder(
+                    surfaceRequest = spec.surfaceRequest,
+                    transformationInfo = spec.transformationInfo,
+                    coordinateTransformer = coordinateTransformer,
+                    alignment = Alignment.Center,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(route?.camera?.id, zoom, spec.surfaceRequest.requestId) {
+                            detectTransformGestures { _, _, scale, _ ->
+                                if (scale != 1f) onZoom(zoom * scale)
+                            }
+                        }
+                        .pointerInput(route?.camera?.id, proEnabled, spec.surfaceRequest.requestId) {
+                            detectTapGestures { point ->
+                                if (!proEnabled && bindResult is CameraBindResult.Success) {
+                                    val sourcePoint = with(coordinateTransformer) { point.transform() }
+                                    focusPoint = point
+                                    onTapFocus(sourcePoint, spec.previewSize)
+                                }
+                            }
+                        },
+                ) {
+                    onSurfaceSession {
+                        onSurfaceAvailable(surface)
+                        try {
+                            awaitCancellation()
+                        } finally {
+                            controller.unbind()
+                        }
                     }
                 }
-                .pointerInput(route?.camera?.id, proEnabled) {
-                    detectTapGestures { point ->
-                        if (!proEnabled) onTapFocus(point, size.width.toFloat(), size.height.toFloat())
-                    }
-                },
-        )
+            } else {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            }
+
+            focusPoint?.takeIf { !proEnabled }?.let { point ->
+                Surface(
+                    modifier = Modifier
+                        .offset {
+                            IntOffset(
+                                (point.x - 28).roundToInt(),
+                                (point.y - 28).roundToInt(),
+                            )
+                        }
+                        .size(56.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    color = Color.Transparent,
+                    border = BorderStroke(2.dp, Color.White),
+                ) {}
+            }
+        }
 
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
-                .background(Color.Black.copy(alpha = 0.62f))
-                .padding(top = 38.dp, start = 4.dp, end = 4.dp, bottom = 8.dp),
+                .background(Color.Black)
+                .padding(top = 34.dp, start = 4.dp, end = 4.dp, bottom = 8.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
             TopControl(
@@ -556,24 +621,8 @@ private fun CameraView(
         (bindResult as? CameraBindResult.Failure)?.let { failure ->
             StatusPill(
                 text = "Lens ${failure.cameraId}: ${failure.reason}",
-                modifier = Modifier.align(Alignment.TopCenter).padding(top = 94.dp),
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 88.dp),
             )
-        }
-
-        focusPoint?.takeIf { !proEnabled }?.let { point ->
-            Surface(
-                modifier = Modifier
-                    .offset {
-                        IntOffset(
-                            (point.x - 28).roundToInt(),
-                            (point.y - 28).roundToInt(),
-                        )
-                    }
-                    .size(56.dp),
-                shape = RoundedCornerShape(8.dp),
-                color = Color.Transparent,
-                border = BorderStroke(2.dp, Color.White),
-            ) {}
         }
 
         if (!proEnabled && exposureRange.first != exposureRange.last) {
@@ -581,7 +630,7 @@ private fun CameraView(
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
                     .padding(end = 6.dp)
-                    .background(Color.Black.copy(alpha = 0.62f), RoundedCornerShape(18.dp))
+                    .background(Color.Black.copy(alpha = 0.72f), RoundedCornerShape(18.dp))
                     .padding(6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
@@ -604,8 +653,8 @@ private fun CameraView(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color.Black.copy(alpha = 0.92f))
-                .padding(top = 8.dp, bottom = 22.dp),
+                .background(Color.Black)
+                .padding(top = 8.dp, bottom = 18.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             LazyRow(
@@ -633,7 +682,7 @@ private fun CameraView(
                 },
                 color = Color.White.copy(alpha = 0.82f),
                 style = MaterialTheme.typography.labelLarge,
-                modifier = Modifier.padding(vertical = 6.dp),
+                modifier = Modifier.padding(vertical = 5.dp),
             )
 
             Row(
@@ -666,7 +715,7 @@ private fun CameraView(
                 Surface(
                     modifier = Modifier.size(50.dp),
                     shape = CircleShape,
-                    color = Color.Black.copy(alpha = 0.7f),
+                    color = Color.Black,
                     border = BorderStroke(1.dp, Color.DarkGray),
                     onClick = onFlip,
                 ) {
@@ -695,21 +744,54 @@ private fun CameraView(
 }
 
 @Composable
+private fun PreviewViewport(
+    aspect: PhotoAspectRatio,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
+        val landscape = maxWidth > maxHeight
+        val targetAspect = if (landscape) {
+            aspect.width.toFloat() / aspect.height.toFloat()
+        } else {
+            aspect.height.toFloat() / aspect.width.toFloat()
+        }
+        val parentAspect = if (maxHeight.value > 0f) maxWidth.value / maxHeight.value else targetAspect
+        val viewportModifier = if (targetAspect >= parentAspect) {
+            Modifier.fillMaxWidth().aspectRatio(targetAspect)
+        } else {
+            Modifier.fillMaxHeight().aspectRatio(targetAspect)
+        }
+        Box(
+            viewportModifier
+                .align(Alignment.Center)
+                .background(Color.Black),
+        ) {
+            content()
+        }
+    }
+}
+
+@Composable
 private fun CaptureStatus(result: PhotoCaptureResult?) {
     val message = when (result) {
         is PhotoCaptureResult.Processing -> result.message
         is PhotoCaptureResult.Failure -> result.message
-        is PhotoCaptureResult.Success -> when {
-            result.usedFormatFallback ->
-                "${result.requestedFormat.name} unavailable on this route/session; saved ${result.actualFormat.name}."
-            result.actualFormat == PhotoOutputFormat.DNG -> "Saved RAW sensor frame as DNG."
-            result.actualFormat == PhotoOutputFormat.HEIF &&
-                result.heifEncodingPath == HeifEncodingPath.SOFTWARE_HEVC ->
-                "Saved HEIF using YUV + HEVC background pipeline."
-            result.actualFormat == PhotoOutputFormat.HEIF &&
-                result.heifEncodingPath == HeifEncodingPath.NATIVE_CAMERA ->
-                "Saved native Camera2 HEIF."
-            else -> null
+        is PhotoCaptureResult.Success -> {
+            val resolution = formatResolution(result.width, result.height)
+            when {
+                result.usedFormatFallback ->
+                    "${result.requestedFormat.name} unavailable; saved ${result.actualFormat.name} · $resolution"
+                result.actualFormat == PhotoOutputFormat.DNG ->
+                    "Saved RAW DNG · $resolution"
+                result.actualFormat == PhotoOutputFormat.HEIF &&
+                    result.heifEncodingPath == HeifEncodingPath.SOFTWARE_HEVC ->
+                    "Saved HEIF via YUV + HEVC · $resolution"
+                result.actualFormat == PhotoOutputFormat.HEIF &&
+                    result.heifEncodingPath == HeifEncodingPath.NATIVE_CAMERA ->
+                    "Saved native Camera2 HEIF · $resolution"
+                else -> "Saved ${result.actualFormat.name} · $resolution"
+            }
         }
         null -> null
     } ?: return
@@ -722,7 +804,7 @@ private fun CaptureStatus(result: PhotoCaptureResult?) {
             Color.White.copy(alpha = 0.76f)
         },
         style = MaterialTheme.typography.bodySmall,
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp),
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
     )
 }
 
@@ -798,7 +880,7 @@ private fun StatusPill(text: String, modifier: Modifier = Modifier) {
     Surface(
         modifier,
         shape = RoundedCornerShape(18.dp),
-        color = Color.Black.copy(alpha = 0.72f),
+        color = Color.Black.copy(alpha = 0.78f),
     ) {
         Text(
             text,
@@ -854,9 +936,9 @@ private fun SettingsSheet(
             }
             Text(
                 if (rawAvailable) {
-                    "RAW DNG is available on this direct Camera2 lens. HEIF finalization now runs in the background, so the shutter can recover before HEVC encoding finishes."
+                    "Still capture now checks both normal and Camera2 high-resolution output lists. RAW DNG uses the native RAW_SENSOR stream; HEIF uses native HEIC or high-resolution YUV + HEVC."
                 } else {
-                    "This lens does not expose an independently usable RAW_SENSOR route. HEIF still uses native HEIC, then YUV + HEVC, then JPEG as the final fallback."
+                    "Still capture checks both normal and high-resolution Camera2 sizes. This lens does not expose an independently usable RAW_SENSOR route."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -872,7 +954,7 @@ private fun SettingsSheet(
                 enabled = photoFormat != PhotoOutputFormat.DNG,
             )
             Text(
-                "Quality applies to HEIF/JPEG. DNG stores the RAW sensor frame rather than an HEVC/JPEG encode.",
+                "Preview resolution is independent from photo resolution. Aspect modes crop the high-quality source instead of selecting tiny preview streams.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -885,7 +967,7 @@ private fun SettingsSheet(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                "DNG always contains the sensor's native RAW dimensions; display aspect selection is for the normal processed-photo viewfinder/capture path.",
+                "DNG keeps native RAW dimensions. Processed HEIF/JPEG uses the selected composition when the chosen pipeline supports it.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -949,7 +1031,11 @@ private fun ProSheet(
                 Column(Modifier.width(240.dp)) {
                     Text("Manual sensor", fontWeight = FontWeight.SemiBold)
                     Text(
-                        if (supported) "Manual ISO, shutter and focus use Camera2 sensor controls." else "Not exposed by this lens.",
+                        if (supported) {
+                            "Manual ISO, shutter and focus use Camera2 sensor controls."
+                        } else {
+                            "Not exposed by this lens."
+                        },
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
@@ -1121,9 +1207,7 @@ private fun cameraPermissionsGranted(context: Context): Boolean = requiredCamera
     ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
 }
 
-private fun displayRotationDegrees(textureView: TextureView): Int = when (
-    textureView.display?.rotation ?: Surface.ROTATION_0
-) {
+private fun displayRotationDegrees(rotation: Int): Int = when (rotation) {
     Surface.ROTATION_90 -> 90
     Surface.ROTATION_180 -> 180
     Surface.ROTATION_270 -> 270
@@ -1150,6 +1234,11 @@ private fun flashLabel(mode: CameraFlashMode): String = when (mode) {
     CameraFlashMode.AUTO -> "Flash Auto"
     CameraFlashMode.ON -> "Flash On"
     CameraFlashMode.TORCH -> "Torch"
+}
+
+private fun formatResolution(width: Int, height: Int): String {
+    val megapixels = width.toDouble() * height.toDouble() / 1_000_000.0
+    return String.format(Locale.US, "%dx%d · %.1f MP", width, height, megapixels)
 }
 
 private fun formatShutter(exposureTimeNs: Long): String {
