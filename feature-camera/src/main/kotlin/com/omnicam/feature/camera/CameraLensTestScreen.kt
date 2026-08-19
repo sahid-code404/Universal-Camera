@@ -1,6 +1,6 @@
 package com.omnicam.feature.camera
 
-import androidx.camera.view.PreviewView
+import android.view.TextureView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -38,9 +38,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.omnicam.camera.camerax.Camera2AuxPreviewController
 import com.omnicam.camera.camerax.CameraBindResult
-import com.omnicam.camera.camerax.CameraXPreviewController
 import com.omnicam.camera.camerax.CaptureProbeResult
 import com.omnicam.camera.capability.CameraCapabilityScanner
 import com.omnicam.core.model.CameraDescriptor
@@ -54,19 +53,13 @@ import kotlin.math.abs
 @Composable
 fun CameraLensTestRoute(
     scanner: CameraCapabilityScanner,
-    previewController: CameraXPreviewController,
+    previewController: Camera2AuxPreviewController,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
-    val previewView = remember(context) {
-        PreviewView(context).apply {
-            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-            scaleType = PreviewView.ScaleType.FILL_CENTER
-        }
-    }
+    val textureView = remember(context) { TextureView(context) }
 
     var profile by remember { mutableStateOf<DeviceCameraProfile?>(null) }
     var scanError by remember { mutableStateOf<String?>(null) }
@@ -85,13 +78,12 @@ fun CameraLensTestRoute(
             .onFailure { scanError = it.message ?: it::class.java.simpleName }
     }
 
-    LaunchedEffect(selectedCameraId, lifecycleOwner) {
+    LaunchedEffect(selectedCameraId) {
         val cameraId = selectedCameraId ?: return@LaunchedEffect
         binding = true
         captureResult = null
         bindResult = previewController.bind(
-            lifecycleOwner = lifecycleOwner,
-            previewView = previewView,
+            textureView = textureView,
             cameraId = cameraId,
         )
         binding = false
@@ -109,7 +101,7 @@ fun CameraLensTestRoute(
             }
             else -> LensTestContent(
                 profile = requireNotNull(profile),
-                previewView = previewView,
+                textureView = textureView,
                 selectedCameraId = selectedCameraId,
                 bindResult = bindResult,
                 captureResult = captureResult,
@@ -132,7 +124,7 @@ fun CameraLensTestRoute(
 @Composable
 private fun LensTestContent(
     profile: DeviceCameraProfile,
-    previewView: PreviewView,
+    textureView: TextureView,
     selectedCameraId: String?,
     bindResult: CameraBindResult?,
     captureResult: CaptureProbeResult?,
@@ -158,7 +150,7 @@ private fun LensTestContent(
                 .background(Color.Black),
         ) {
             AndroidView(
-                factory = { previewView },
+                factory = { textureView },
                 modifier = Modifier.fillMaxSize(),
             )
 
@@ -171,7 +163,7 @@ private fun LensTestContent(
             ) {
                 TextButton(onClick = onBack) { Text("‹ Diagnostics", color = Color.White) }
                 Text(
-                    "LIVE AUX TEST",
+                    "DIRECT CAMERA2 AUX TEST",
                     color = Color.White,
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
@@ -201,7 +193,7 @@ private fun LensTestContent(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
-                "${backCameras.size} exposed rear Camera2 IDs",
+                "${backCameras.size} exposed rear Camera2 IDs · direct open",
                 color = Color.White.copy(alpha = 0.72f),
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -238,7 +230,7 @@ private fun LensTestContent(
                 onClick = onCapture,
                 shape = CircleShape,
             ) {
-                Text(if (capturing) "Capturing…" else "Capture probe")
+                Text(if (capturing) "Reading frame…" else "Frame probe")
             }
 
             Text(
@@ -292,16 +284,16 @@ private fun LensTestError(message: String, onBack: () -> Unit) {
 }
 
 private fun bindStatus(result: CameraBindResult?, binding: Boolean): String = when (result) {
-    is CameraBindResult.Success -> "Requested ${result.requestedCameraId} · active ${result.actualCameraId}"
+    is CameraBindResult.Success -> "Camera2 direct · requested ${result.requestedCameraId} · active ${result.actualCameraId}"
     is CameraBindResult.Failure -> "Camera ${result.cameraId} failed: ${result.reason}"
-    null -> if (binding) "Opening camera…" else "Select a camera"
+    null -> if (binding) "Opening exact Camera2 ID…" else "Select a camera"
 }
 
 private fun captureStatus(result: CaptureProbeResult?): String = when (result) {
     is CaptureProbeResult.Success ->
-        "Capture OK · ID ${result.cameraId} · ${result.width}×${result.height} · format ${result.format}"
-    is CaptureProbeResult.Failure -> "Capture failed: ${result.reason}"
-    null -> "This probe keeps the captured frame in memory and does not save a photo."
+        "Frame OK · ID ${result.cameraId} · ${result.width}×${result.height} · format ${result.format}"
+    is CaptureProbeResult.Failure -> "Frame probe failed: ${result.reason}"
+    null -> "Direct Camera2 bypasses CameraX filtering. Frame probe reads the live preview in memory."
 }
 
 private fun chooseDefaultRearCamera(profile: DeviceCameraProfile): CameraDescriptor? = profile.cameras
