@@ -36,7 +36,7 @@ import kotlinx.coroutines.withTimeout
  * fused into one 16-bit Bayer buffer at the reference exposure. C1 deliberately stays in the RAW
  * domain; custom demosaic/color/tone-map and multi-frame super-resolution are later stages.
  */
-internal class ComputationalRawEngine(
+class ComputationalRawEngine(
     private val cameraHandler: Handler,
     private val imageHandler: Handler,
     private val scratchDir: File,
