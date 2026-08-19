@@ -6,6 +6,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -38,6 +39,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.omnicam.camera.capability.toSanitizedJson
 import com.omnicam.core.model.CameraDescriptor
+import com.omnicam.core.model.DeviceCameraProfile
 import java.util.Locale
 
 @Composable
@@ -64,7 +66,9 @@ fun CameraDiagnosticsRoute(
         val payload = pendingExport
         if (uri != null && payload != null) {
             runCatching {
-                context.contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { it.write(payload) }
+                context.contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { writer ->
+                    writer.write(payload)
+                }
             }
         }
         pendingExport = null
@@ -75,9 +79,10 @@ fun CameraDiagnosticsRoute(
     }
 
     Surface(modifier = modifier.fillMaxSize()) {
-        when {
-            !permissionGranted -> PermissionContent(onRequestPermission = { permissionLauncher.launch(Manifest.permission.CAMERA) })
-            else -> DiagnosticsContent(
+        if (!permissionGranted) {
+            PermissionContent(onRequestPermission = { permissionLauncher.launch(Manifest.permission.CAMERA) })
+        } else {
+            DiagnosticsContent(
                 state = state,
                 onRetry = { viewModel.scan(force = true) },
                 onExport = { profile ->
@@ -92,7 +97,9 @@ fun CameraDiagnosticsRoute(
 @Composable
 private fun PermissionContent(onRequestPermission: () -> Unit) {
     Column(
-        modifier = Modifier.fillMaxSize().padding(28.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(28.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -111,12 +118,10 @@ private fun PermissionContent(onRequestPermission: () -> Unit) {
 private fun DiagnosticsContent(
     state: CameraDiagnosticsUiState,
     onRetry: () -> Unit,
-    onExport: (com.omnicam.core.model.DeviceCameraProfile) -> Unit,
+    onExport: (DeviceCameraProfile) -> Unit,
 ) {
     when (state) {
-        CameraDiagnosticsUiState.Idle,
-        CameraDiagnosticsUiState.Scanning,
-        -> Column(
+        CameraDiagnosticsUiState.Idle, CameraDiagnosticsUiState.Scanning -> Column(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -127,7 +132,9 @@ private fun DiagnosticsContent(
         }
 
         is CameraDiagnosticsUiState.Error -> Column(
-            modifier = Modifier.fillMaxSize().padding(28.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(28.dp),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -142,11 +149,15 @@ private fun DiagnosticsContent(
             val profile = state.profile
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp),
+                contentPadding = PaddingValues(20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 item {
-                    Text("OmniCam Camera Diagnostics", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                    Text(
+                        "OmniCam Camera Diagnostics",
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
                     Text(
                         "${profile.manufacturer} ${profile.model} · Android API ${profile.sdkInt}",
                         style = MaterialTheme.typography.bodyMedium,
@@ -183,7 +194,11 @@ private fun CameraCard(camera: CameraDescriptor) {
     ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Camera ${camera.id}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "Camera ${camera.id}",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold,
+                )
                 Text(camera.classification.role.name.replace('_', ' '), style = MaterialTheme.typography.labelLarge)
             }
             Text(
@@ -213,7 +228,10 @@ private fun CameraCard(camera: CameraDescriptor) {
                 style = MaterialTheme.typography.bodyMedium,
             )
             if (!camera.directlyListed) {
-                Text("Physical member; not directly listed as an openable camera ID", style = MaterialTheme.typography.labelMedium)
+                Text(
+                    "Physical member; not directly listed as an openable camera ID",
+                    style = MaterialTheme.typography.labelMedium,
+                )
             }
         }
     }
