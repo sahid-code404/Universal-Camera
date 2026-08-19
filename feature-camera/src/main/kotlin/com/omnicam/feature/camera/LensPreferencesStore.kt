@@ -23,10 +23,18 @@ data class LensPreferences(
     val rearOrder: List<String> = emptyList(),
     val frontOrder: List<String> = emptyList(),
     val disabledCameraIds: Set<String> = emptySet(),
+    val upscaleDisabledCameraIds: Set<String> = emptySet(),
     val photoFormat: PhotoOutputFormat = PhotoOutputFormat.HEIF,
     val photoQuality: Int = 100,
 ) {
     fun isEnabled(cameraId: String): Boolean = cameraId !in disabledCameraIds
+
+    /**
+     * Adaptive upscaling defaults to enabled so existing users keep the low-resolution-camera
+     * improvement. The preference is stored as an opt-out set, which also makes newly discovered
+     * lenses automatically receive the capability-driven default without model-specific IDs.
+     */
+    fun isUpscalingEnabled(cameraId: String): Boolean = cameraId !in upscaleDisabledCameraIds
 
     fun applyOrder(
         routes: List<ValuableCameraRoute>,
@@ -48,6 +56,8 @@ interface LensPreferencesStore {
     val preferences: Flow<LensPreferences>
 
     suspend fun setEnabled(cameraId: String, enabled: Boolean)
+
+    suspend fun setUpscalingEnabled(cameraId: String, enabled: Boolean)
 
     suspend fun setOrder(facing: LensFacing, cameraIds: List<String>)
 
@@ -77,6 +87,14 @@ class DataStoreLensPreferencesStore(
         }
     }
 
+    override suspend fun setUpscalingEnabled(cameraId: String, enabled: Boolean) {
+        dataStore.edit { mutable ->
+            val disabled = mutable[Keys.upscaleDisabledIds].orEmpty().toMutableSet()
+            if (enabled) disabled.remove(cameraId) else disabled.add(cameraId)
+            mutable[Keys.upscaleDisabledIds] = disabled
+        }
+    }
+
     override suspend fun setOrder(facing: LensFacing, cameraIds: List<String>) {
         val key = when (facing) {
             LensFacing.BACK -> Keys.rearOrder
@@ -99,6 +117,7 @@ class DataStoreLensPreferencesStore(
             mutable.remove(Keys.rearOrder)
             mutable.remove(Keys.frontOrder)
             mutable.remove(Keys.disabledIds)
+            mutable.remove(Keys.upscaleDisabledIds)
             mutable.remove(Keys.photoFormat)
             mutable.remove(Keys.photoQuality)
         }
@@ -108,6 +127,7 @@ class DataStoreLensPreferencesStore(
         rearOrder = decodeOrder(preferences[Keys.rearOrder]),
         frontOrder = decodeOrder(preferences[Keys.frontOrder]),
         disabledCameraIds = preferences[Keys.disabledIds].orEmpty(),
+        upscaleDisabledCameraIds = preferences[Keys.upscaleDisabledIds].orEmpty(),
         photoFormat = preferences[Keys.photoFormat]
             ?.let { stored -> runCatching { PhotoOutputFormat.valueOf(stored) }.getOrNull() }
             ?: PhotoOutputFormat.HEIF,
@@ -118,6 +138,7 @@ class DataStoreLensPreferencesStore(
         val rearOrder = stringPreferencesKey("rear_order")
         val frontOrder = stringPreferencesKey("front_order")
         val disabledIds = stringSetPreferencesKey("disabled_camera_ids")
+        val upscaleDisabledIds = stringSetPreferencesKey("upscale_disabled_camera_ids")
         val photoFormat = stringPreferencesKey("photo_format")
         val photoQuality = intPreferencesKey("photo_quality")
     }
