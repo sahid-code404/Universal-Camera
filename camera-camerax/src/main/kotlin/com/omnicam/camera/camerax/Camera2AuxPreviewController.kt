@@ -166,7 +166,7 @@ class Camera2AuxPreviewController(
         builder: CaptureRequest.Builder,
         characteristics: CameraCharacteristics,
     ) {
-        val modes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES).orEmpty()
+        val modes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
         when {
             modes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) ->
                 builder.set(
