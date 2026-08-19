@@ -9,6 +9,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.OutputConfiguration
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -22,12 +23,11 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /**
- * Direct Camera2 preview path used by the auxiliary-camera compatibility probe.
+ * Low-level Camera2 auxiliary preview path.
  *
- * CameraX may apply its own camera availability filtering before a CameraSelector is evaluated.
- * This controller intentionally bypasses CameraX and opens the exact CameraManager ID requested
- * by the caller. It remains a diagnostic/compatibility path until physical-device validation is
- * complete.
+ * It supports both independently listed camera IDs and physical cameras that must be addressed as
+ * an output of a logical multi-camera device. CameraX remains useful elsewhere, but this layer is
+ * intentionally exact because vendor/auxiliary routing can be filtered before CameraX selection.
  */
 class Camera2AuxPreviewController(
     context: Context,
@@ -43,60 +43,94 @@ class Camera2AuxPreviewController(
     private var activeTextureView: TextureView? = null
     private var boundCameraId: String? = null
 
-    @SuppressLint("MissingPermission")
     suspend fun bind(
         textureView: TextureView,
         cameraId: String,
+    ): CameraBindResult = bindInternal(
+        textureView = textureView,
+        requestedCameraId = cameraId,
+        deviceCameraId = cameraId,
+        physicalCameraId = null,
+    )
+
+    suspend fun bindPhysical(
+        textureView: TextureView,
+        logicalCameraId: String,
+        physicalCameraId: String,
+    ): CameraBindResult = bindInternal(
+        textureView = textureView,
+        requestedCameraId = physicalCameraId,
+        deviceCameraId = logicalCameraId,
+        physicalCameraId = physicalCameraId,
+    )
+
+    @SuppressLint("MissingPermission")
+    private suspend fun bindInternal(
+        textureView: TextureView,
+        requestedCameraId: String,
+        deviceCameraId: String,
+        physicalCameraId: String?,
     ): CameraBindResult = withContext(Dispatchers.Main.immediate) {
         closeCurrent()
 
         runCatching {
-            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val streamCharacteristics = cameraManager.getCameraCharacteristics(
+                physicalCameraId ?: deviceCameraId,
+            )
+            val controlCharacteristics = cameraManager.getCameraCharacteristics(deviceCameraId)
             val surfaceTexture = awaitSurfaceTexture(textureView)
-            val previewSize = choosePreviewSize(characteristics)
+            val previewSize = choosePreviewSize(streamCharacteristics)
             surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
 
             val surface = Surface(surfaceTexture)
             previewSurface = surface
             activeTextureView = textureView
 
-            val device = openCamera(cameraId)
+            val device = openCamera(deviceCameraId)
             cameraDevice = device
 
-            val session = createPreviewSession(device, surface)
+            val session = createPreviewSession(
+                device = device,
+                surface = surface,
+                physicalCameraId = physicalCameraId,
+            )
             captureSession = session
 
             val request = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(surface)
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                setContinuousAfIfSupported(this, characteristics)
+                setContinuousAfIfSupported(this, controlCharacteristics)
             }.build()
             session.setRepeatingRequest(request, null, cameraHandler)
-            boundCameraId = cameraId
+            boundCameraId = requestedCameraId
 
             val minZoom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.lower ?: 1f
+                streamCharacteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.lower ?: 1f
             } else {
                 1f
             }
             val maxZoom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper
-                    ?: characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
+                streamCharacteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper
+                    ?: streamCharacteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
                     ?: 1f
             } else {
-                characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+                streamCharacteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
             }
 
             CameraBindResult.Success(
-                requestedCameraId = cameraId,
-                actualCameraId = cameraId,
+                requestedCameraId = requestedCameraId,
+                actualCameraId = if (physicalCameraId == null) {
+                    deviceCameraId
+                } else {
+                    "$deviceCameraId→$physicalCameraId"
+                },
                 minZoomRatio = minZoom,
                 maxZoomRatio = maxZoom,
             )
         }.getOrElse { error ->
             closeCurrent()
             CameraBindResult.Failure(
-                cameraId = cameraId,
+                cameraId = requestedCameraId,
                 reason = buildString {
                     append(error::class.java.simpleName)
                     error.message?.takeIf { it.isNotBlank() }?.let {
@@ -108,13 +142,10 @@ class Camera2AuxPreviewController(
         }
     }
 
-    /**
-     * Keeps the probe entirely in memory. At this stage it verifies that the direct Camera2
-     * preview is delivering pixels; a dedicated still-capture session is a later hardware gate.
-     */
+    /** Keeps the compatibility probe entirely in memory. */
     suspend fun captureProbe(): CaptureProbeResult = withContext(Dispatchers.Main.immediate) {
         val cameraId = boundCameraId
-            ?: return@withContext CaptureProbeResult.Failure("No Camera2 device is currently bound")
+            ?: return@withContext CaptureProbeResult.Failure("No Camera2 route is currently bound")
         val textureView = activeTextureView
             ?: return@withContext CaptureProbeResult.Failure("Preview surface is unavailable")
 
@@ -224,31 +255,51 @@ class Camera2AuxPreviewController(
     private suspend fun createPreviewSession(
         device: CameraDevice,
         surface: Surface,
+        physicalCameraId: String?,
     ): CameraCaptureSession = suspendCancellableCoroutine { continuation ->
+        val callback = object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(session: CameraCaptureSession) {
+                if (continuation.isActive) {
+                    continuation.resume(session)
+                } else {
+                    session.close()
+                }
+            }
+
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+                session.close()
+                if (continuation.isActive) {
+                    continuation.resumeWithException(
+                        IllegalStateException(
+                            if (physicalCameraId == null) {
+                                "Camera2 preview session configuration failed"
+                            } else {
+                                "Logical camera ${device.id} could not route physical camera $physicalCameraId"
+                            },
+                        ),
+                    )
+                }
+            }
+        }
+
         try {
             @Suppress("DEPRECATION")
-            device.createCaptureSession(
-                listOf(surface),
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: CameraCaptureSession) {
-                        if (continuation.isActive) {
-                            continuation.resume(session)
-                        } else {
-                            session.close()
-                        }
-                    }
-
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        session.close()
-                        if (continuation.isActive) {
-                            continuation.resumeWithException(
-                                IllegalStateException("Camera2 preview session configuration failed"),
-                            )
-                        }
-                    }
-                },
-                cameraHandler,
-            )
+            if (physicalCameraId == null) {
+                device.createCaptureSession(
+                    listOf(surface),
+                    callback,
+                    cameraHandler,
+                )
+            } else {
+                val output = OutputConfiguration(surface).apply {
+                    setPhysicalCameraId(physicalCameraId)
+                }
+                device.createCaptureSessionByOutputConfigurations(
+                    listOf(output),
+                    callback,
+                    cameraHandler,
+                )
+            }
         } catch (error: Throwable) {
             if (continuation.isActive) continuation.resumeWithException(error)
         }
