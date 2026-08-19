@@ -14,13 +14,34 @@ enum class ComputationalRawPreset(
     MAX("MAX · 8 frames", 8, listOf(-2.5f, -1.5f, -0.7f, 0f, 0f, 0f, 0f, 0f)),
 }
 
+enum class LightningFlashMode(val label: String) {
+    OFF("OFF"),
+    AUTO("AUTO"),
+    ON("ON"),
+    TORCH("TORCH"),
+}
+
+enum class LightningFocusStatus {
+    IDLE,
+    SCANNING,
+    FOCUSED,
+    FAILED,
+}
+
+data class LightningFocusState(
+    val normalizedX: Float = 0.5f,
+    val normalizedY: Float = 0.5f,
+    val status: LightningFocusStatus = LightningFocusStatus.IDLE,
+)
+
 data class ComputationalRawViewfinderSpec(
     val previewSize: Size,
     val rotationDegrees: Int,
     val mirrorX: Boolean,
+    val targetAspect: Float?,
 )
 
-data class YuvPreviewFrame(
+data class JpegPreviewFrame(
     val bitmap: Bitmap,
     val timestampNanos: Long,
 )
