@@ -2,10 +2,12 @@ package com.omnicam.feature.camera
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.ImageDecoder
 import android.net.Uri
 import android.view.Surface as AndroidSurface
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
@@ -13,6 +15,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -47,9 +50,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -64,11 +69,14 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.omnicam.camera.camerax.ComputationalRawBindResult
 import com.omnicam.camera.camerax.ComputationalRawPreset
+import com.omnicam.camera.camerax.JpegPreviewFrame
 import com.omnicam.camera.camerax.LightningCaptureResult
+import com.omnicam.camera.camerax.LightningFlashMode
+import com.omnicam.camera.camerax.LightningFocusState
+import com.omnicam.camera.camerax.LightningFocusStatus
 import com.omnicam.camera.camerax.LightningJobStage
 import com.omnicam.camera.camerax.LightningRawController
 import com.omnicam.camera.camerax.LightningRawTuning
-import com.omnicam.camera.camerax.YuvPreviewFrame
 import com.omnicam.camera.capability.CameraCapabilityScanner
 import com.omnicam.camera.capability.CameraRouteAccess
 import com.omnicam.camera.capability.ValuableCameraResolver
@@ -109,6 +117,7 @@ fun LightningCameraRoute(
     val jobs by controller.jobs.collectAsState()
     val cameraState by controller.cameraState.collectAsState()
     val previewFrame by controller.previewFrame.collectAsState()
+    val focusState by controller.focusState.collectAsState()
 
     var permissionGranted by remember { mutableStateOf(hasPermission(context)) }
     var routes by remember { mutableStateOf<List<ValuableCameraRoute>>(emptyList()) }
@@ -123,7 +132,6 @@ fun LightningCameraRoute(
     var gridEnabled by remember { mutableStateOf(true) }
     var capturing by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("Ready") }
-    var viewerUri by remember { mutableStateOf<Uri?>(null) }
     var resumed by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
     }
@@ -172,9 +180,7 @@ fun LightningCameraRoute(
                             if (it.camera.lensFacing == LensFacing.BACK) 0 else 1
                         }.thenBy(::eqFocal),
                     )
-                if (selectedId !in routes.map { it.camera.id }) {
-                    selectedId = wide(routes)?.camera?.id
-                }
+                if (selectedId !in routes.map { it.camera.id }) selectedId = wide(routes)?.camera?.id
             }
             .onFailure { scanError = it.message ?: "Camera scan failed" }
     }
@@ -188,10 +194,10 @@ fun LightningCameraRoute(
     val lastSaved = jobs.firstOrNull { it.stage == LightningJobStage.SAVED && it.dngUri != null }
     val displayRotation = rotationDegrees(view.display?.rotation ?: AndroidSurface.ROTATION_0)
 
-    LaunchedEffect(selectedId, aspect, resumed, viewerUri, displayRotation) {
+    LaunchedEffect(selectedId, aspect, resumed, displayRotation) {
         controller.unbind()
         bindResult = null
-        if (!resumed || viewerUri != null) return@LaunchedEffect
+        if (!resumed) return@LaunchedEffect
         val route = selected ?: return@LaunchedEffect
         val spec = runCatching {
             controller.createViewfinderSpec(
@@ -201,10 +207,7 @@ fun LightningCameraRoute(
                 sessionKey = "${route.camera.id}-${aspect.name}-${System.nanoTime()}",
             )
         }.onFailure {
-            bindResult = ComputationalRawBindResult.Failure(
-                route.camera.id,
-                it.message ?: "Camera unavailable",
-            )
+            bindResult = ComputationalRawBindResult.Failure(route.camera.id, it.message ?: "Camera unavailable")
         }.getOrNull() ?: return@LaunchedEffect
 
         bindResult = runCatching { controller.bind(spec, route) }
@@ -216,9 +219,11 @@ fun LightningCameraRoute(
     LaunchedEffect(jobs, capturing) {
         if (capturing) return@LaunchedEffect
         val active = jobs.firstOrNull { !it.terminal }
+        val failed = jobs.firstOrNull { it.stage == LightningJobStage.FAILED }
         val saved = jobs.firstOrNull { it.stage == LightningJobStage.SAVED }
         message = when {
             active != null -> "Processing ${jobs.count { !it.terminal }} DNG"
+            failed != null && failed.id > (saved?.id ?: 0L) -> "Failed: ${failed.message}"
             saved != null -> saved.message
             else -> "Ready"
         }
@@ -230,7 +235,6 @@ fun LightningCameraRoute(
 
     Surface(modifier.fillMaxSize(), color = Color.Black) {
         when {
-            viewerUri != null -> InAppDngViewer(viewerUri!!, onClose = { viewerUri = null })
             !permissionGranted -> CenterText("Camera permission required") {
                 permissionLauncher.launch(Manifest.permission.CAMERA)
             }
@@ -239,6 +243,7 @@ fun LightningCameraRoute(
             else -> Box(Modifier.fillMaxSize().background(Color.Black)) {
                 PreviewArea(
                     frame = previewFrame,
+                    focusState = focusState,
                     controller = controller,
                     aspect = aspect,
                     gridEnabled = gridEnabled,
@@ -249,6 +254,11 @@ fun LightningCameraRoute(
 
                 TopCameraBar(
                     aspect = aspect,
+                    flashAvailable = cameraState.flashAvailable,
+                    flashMode = cameraState.flashMode,
+                    onFlash = {
+                        if (cameraState.flashAvailable) controller.setFlashMode(nextFlash(cameraState.flashMode))
+                    },
                     onMore = { sheet = toggleSheet(sheet, CameraSheet.CONTROLS) },
                     modifier = Modifier.align(Alignment.TopCenter),
                 )
@@ -270,7 +280,9 @@ fun LightningCameraRoute(
                     onLens = { selectedId = it },
                     onZoom = controller::setZoomRatio,
                     onPreset = { preset = it },
-                    onGallery = { lastSaved?.dngUri?.let { viewerUri = it } },
+                    onGallery = {
+                        lastSaved?.dngUri?.let { openExternalPhoto(context, it) }
+                    },
                     onFlip = {
                         val opposite = if (selected?.camera?.lensFacing == LensFacing.FRONT) {
                             LensFacing.BACK
@@ -310,11 +322,16 @@ fun LightningCameraRoute(
                     CameraControlSheet(
                         sheet = sheet,
                         aspect = aspect,
+                        flashAvailable = cameraState.flashAvailable,
+                        flashMode = cameraState.flashMode,
                         highlight = highlight,
                         denoise = denoise,
                         upscale = upscale,
                         gridEnabled = gridEnabled,
                         onAspect = { aspect = it; sheet = CameraSheet.NONE },
+                        onFlash = {
+                            if (cameraState.flashAvailable) controller.setFlashMode(nextFlash(cameraState.flashMode))
+                        },
                         onHighlight = { highlight = it },
                         onDenoise = { denoise = it },
                         onUpscale = {
@@ -341,7 +358,8 @@ fun LightningCameraRoute(
 
 @Composable
 private fun PreviewArea(
-    frame: YuvPreviewFrame?,
+    frame: JpegPreviewFrame?,
+    focusState: LightningFocusState,
     controller: LightningRawController,
     aspect: DngAspect,
     gridEnabled: Boolean,
@@ -359,19 +377,28 @@ private fun PreviewArea(
             if (frame != null) {
                 Image(
                     bitmap = frame.bitmap.asImageBitmap(),
-                    contentDescription = "YUV camera preview",
+                    contentDescription = "JPEG camera preview",
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .fillMaxSize()
                         .pointerInput(zoomKey, maxZoom) {
                             detectTransformGestures { _, _, gestureZoom, _ ->
-                                controller.setZoomRatio(
-                                    controller.cameraState.value.zoomRatio * gestureZoom,
-                                )
+                                controller.setZoomRatio(controller.cameraState.value.zoomRatio * gestureZoom)
+                            }
+                        }
+                        .pointerInput(zoomKey) {
+                            detectTapGestures { tap ->
+                                if (size.width > 0 && size.height > 0) {
+                                    controller.focusAt(
+                                        tap.x / size.width.toFloat(),
+                                        tap.y / size.height.toFloat(),
+                                    )
+                                }
                             }
                         },
                 )
                 if (gridEnabled) Grid(Modifier.fillMaxSize())
+                FocusIndicator(focusState, Modifier.fillMaxSize())
             } else {
                 CircularProgressIndicator(color = Color.White)
             }
@@ -380,8 +407,30 @@ private fun PreviewArea(
 }
 
 @Composable
+private fun FocusIndicator(state: LightningFocusState, modifier: Modifier = Modifier) {
+    if (state.status == LightningFocusStatus.IDLE) return
+    Canvas(modifier) {
+        val center = Offset(size.width * state.normalizedX, size.height * state.normalizedY)
+        val radius = 30.dp.toPx()
+        val color = when (state.status) {
+            LightningFocusStatus.FAILED -> Color(0xFFFF453A)
+            else -> IosYellow
+        }
+        drawCircle(color, radius, center, style = Stroke(width = 2.dp.toPx()))
+        val tick = 8.dp.toPx()
+        drawLine(color, Offset(center.x - radius - tick, center.y), Offset(center.x - radius + tick, center.y), 2.dp.toPx())
+        drawLine(color, Offset(center.x + radius - tick, center.y), Offset(center.x + radius + tick, center.y), 2.dp.toPx())
+        drawLine(color, Offset(center.x, center.y - radius - tick), Offset(center.x, center.y - radius + tick), 2.dp.toPx())
+        drawLine(color, Offset(center.x, center.y + radius - tick), Offset(center.x, center.y + radius + tick), 2.dp.toPx())
+    }
+}
+
+@Composable
 private fun TopCameraBar(
     aspect: DngAspect,
+    flashAvailable: Boolean,
+    flashMode: LightningFlashMode,
+    onFlash: () -> Unit,
     onMore: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -390,9 +439,12 @@ private fun TopCameraBar(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Pill("DNG") { }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Pill("YUV") { }
+            Pill("DNG") { }
+            Pill(if (flashAvailable) "⚡ ${flashMode.label}" else "⚡ —", onFlash)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Pill("JPEG") { }
             Pill("${aspect.label}  •••", onMore)
         }
     }
@@ -436,9 +488,7 @@ private fun BottomCameraBar(
         ) {
             routes.forEach { route ->
                 val factor = (eqFocal(route) / baseEq).coerceAtLeast(0.1f)
-                ZoomBubble(zoomText(factor), route.camera.id == selectedId) {
-                    onLens(route.camera.id)
-                }
+                ZoomBubble(zoomText(factor), route.camera.id == selectedId) { onLens(route.camera.id) }
             }
         }
         Text(String.format(Locale.US, "%.1f×", displayZoom), color = IosYellow, fontSize = 11.sp)
@@ -482,7 +532,7 @@ private fun BottomCameraBar(
             CircleButton("↻", canFlip && !capturing, onFlip)
         }
         Text(
-            "NATIVE DNG ONLY",
+            "NATIVE DNG · EXTERNAL GALLERY",
             color = Color.White.copy(alpha = 0.38f),
             fontSize = 8.sp,
             modifier = Modifier.padding(top = 5.dp),
@@ -494,11 +544,14 @@ private fun BottomCameraBar(
 private fun CameraControlSheet(
     sheet: CameraSheet,
     aspect: DngAspect,
+    flashAvailable: Boolean,
+    flashMode: LightningFlashMode,
     highlight: Float,
     denoise: Float,
     upscale: Float,
     gridEnabled: Boolean,
     onAspect: (DngAspect) -> Unit,
+    onFlash: () -> Unit,
     onHighlight: (Float) -> Unit,
     onDenoise: (Float) -> Unit,
     onUpscale: (Float) -> Unit,
@@ -531,7 +584,7 @@ private fun CameraControlSheet(
                 onBack = onClose,
             )
             CameraSheet.UPSCALE -> ValueSlider(
-                title = "PER-LENS UPSCALE",
+                title = "PER-LENS DNG UPSCALE",
                 valueLabel = String.format(Locale.US, "%.1f×", upscale),
                 value = upscale,
                 range = 1f..MAX_UPSCALE,
@@ -558,7 +611,11 @@ private fun CameraControlSheet(
                     Modifier.fillMaxWidth().padding(top = 18.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly,
                 ) {
-                    ControlTile("FLASH OFF", true) { }
+                    ControlTile(
+                        if (flashAvailable) "FLASH ${flashMode.label}" else "NO FLASH",
+                        flashMode != LightningFlashMode.OFF && flashAvailable,
+                        onFlash,
+                    )
                     ControlTile("HIGHLIGHT", false, onOpenHighlight)
                     ControlTile("DENOISE", false, onOpenDenoise)
                 }
@@ -634,18 +691,13 @@ private fun SmallRoundButton(label: String, onClick: () -> Unit) {
         shape = CircleShape,
         color = Color.Black.copy(alpha = 0.28f),
     ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(label, color = Color.White, fontSize = 19.sp)
-        }
+        Box(contentAlignment = Alignment.Center) { Text(label, color = Color.White, fontSize = 19.sp) }
     }
 }
 
 @Composable
 private fun ControlTile(label: String, selected: Boolean, onClick: () -> Unit) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.clickable(onClick = onClick),
-    ) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable(onClick = onClick)) {
         Surface(
             Modifier.size(54.dp),
             shape = CircleShape,
@@ -671,6 +723,7 @@ private fun ControlTile(label: String, selected: Boolean, onClick: () -> Unit) {
 
 private fun tileGlyph(label: String): String = when {
     label.startsWith("FLASH") -> "⚡"
+    label.startsWith("NO FLASH") -> "—"
     label.startsWith("HIGHLIGHT") -> "HL"
     label.startsWith("DENOISE") -> "NR"
     label.startsWith("UP ") -> "↑"
@@ -774,65 +827,10 @@ private fun Grid(modifier: Modifier = Modifier) {
     Canvas(modifier) {
         val c = Color.White.copy(alpha = 0.22f)
         val stroke = 1.dp.toPx()
-        drawLine(
-            c,
-            androidx.compose.ui.geometry.Offset(size.width / 3f, 0f),
-            androidx.compose.ui.geometry.Offset(size.width / 3f, size.height),
-            stroke,
-        )
-        drawLine(
-            c,
-            androidx.compose.ui.geometry.Offset(size.width * 2f / 3f, 0f),
-            androidx.compose.ui.geometry.Offset(size.width * 2f / 3f, size.height),
-            stroke,
-        )
-        drawLine(
-            c,
-            androidx.compose.ui.geometry.Offset(0f, size.height / 3f),
-            androidx.compose.ui.geometry.Offset(size.width, size.height / 3f),
-            stroke,
-        )
-        drawLine(
-            c,
-            androidx.compose.ui.geometry.Offset(0f, size.height * 2f / 3f),
-            androidx.compose.ui.geometry.Offset(size.width, size.height * 2f / 3f),
-            stroke,
-        )
-    }
-}
-
-@Composable
-private fun InAppDngViewer(uri: Uri, onClose: () -> Unit) {
-    val bitmap by dngBitmap(uri, 2200)
-    Box(Modifier.fillMaxSize().background(Color.Black)) {
-        if (bitmap != null) {
-            Image(bitmap!!, "DNG photo", Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
-        } else {
-            Column(
-                Modifier.align(Alignment.Center),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                CircularProgressIndicator(color = Color.White)
-                Text(
-                    "Opening DNG…",
-                    color = Color.White.copy(alpha = 0.7f),
-                    modifier = Modifier.padding(top = 12.dp),
-                )
-            }
-        }
-        Surface(
-            modifier = Modifier.align(Alignment.TopStart).padding(18.dp).size(44.dp).clickable(onClick = onClose),
-            shape = CircleShape,
-            color = Color.Black.copy(alpha = 0.55f),
-        ) {
-            Box(contentAlignment = Alignment.Center) { Text("‹", color = Color.White, fontSize = 34.sp) }
-        }
-        Text(
-            "DNG",
-            color = Color.White,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.align(Alignment.TopCenter).padding(top = 28.dp),
-        )
+        drawLine(c, Offset(size.width / 3f, 0f), Offset(size.width / 3f, size.height), stroke)
+        drawLine(c, Offset(size.width * 2f / 3f, 0f), Offset(size.width * 2f / 3f, size.height), stroke)
+        drawLine(c, Offset(0f, size.height / 3f), Offset(size.width, size.height / 3f), stroke)
+        drawLine(c, Offset(0f, size.height * 2f / 3f), Offset(size.width, size.height * 2f / 3f), stroke)
     }
 }
 
@@ -878,6 +876,25 @@ private fun CenterText(text: String, action: (() -> Unit)? = null) {
             }
         }
     }
+}
+
+private fun openExternalPhoto(context: Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "image/*")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    runCatching {
+        context.startActivity(Intent.createChooser(intent, "Open DNG in gallery"))
+    }.onFailure {
+        Toast.makeText(context, "No gallery app can open this DNG", Toast.LENGTH_SHORT).show()
+    }
+}
+
+private fun nextFlash(mode: LightningFlashMode): LightningFlashMode = when (mode) {
+    LightningFlashMode.OFF -> LightningFlashMode.AUTO
+    LightningFlashMode.AUTO -> LightningFlashMode.ON
+    LightningFlashMode.ON -> LightningFlashMode.TORCH
+    LightningFlashMode.TORCH -> LightningFlashMode.OFF
 }
 
 private fun toggleSheet(current: CameraSheet, requested: CameraSheet): CameraSheet =

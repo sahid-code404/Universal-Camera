@@ -3,6 +3,7 @@ package com.omnicam.camera.camerax
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.hardware.camera2.CameraCaptureSession
@@ -13,6 +14,7 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.media.ImageReader
 import android.net.Uri
 import android.os.Build
@@ -22,10 +24,10 @@ import android.os.HandlerThread
 import android.provider.MediaStore
 import android.util.Range
 import android.util.Size
-import android.view.Surface
 import com.omnicam.camera.capability.CameraRouteAccess
 import com.omnicam.camera.capability.ValuableCameraRoute
 import com.omnicam.core.model.LensFacing
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -35,6 +37,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -42,6 +45,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -63,6 +67,8 @@ data class LightningCameraState(
     val minZoomRatio: Float = 1f,
     val maxZoomRatio: Float = 1f,
     val zoomRatio: Float = 1f,
+    val flashAvailable: Boolean = false,
+    val flashMode: LightningFlashMode = LightningFlashMode.OFF,
 )
 
 sealed interface LightningCaptureResult {
@@ -95,21 +101,21 @@ data class LightningRawJobStatus(
     val terminal: Boolean get() = stage == LightningJobStage.SAVED || stage == LightningJobStage.FAILED
 }
 
-/** Single production camera: YUV_420_888 live preview + native RAW_SENSOR capture saved only as DNG. */
+/** Hardware JPEG live preview + native RAW_SENSOR capture saved only as DNG. */
 class LightningRawController(context: Context) {
     private val appContext = context.applicationContext
     private val cameraManager = appContext.getSystemService(CameraManager::class.java)
-    private val cameraThread = HandlerThread("OmniCam-C19-Camera").apply { start() }
-    private val imageThread = HandlerThread("OmniCam-C19-RawCopy").apply { start() }
-    private val previewThread = HandlerThread("OmniCam-C19-YuvPreview").apply { start() }
+    private val cameraThread = HandlerThread("OmniCam-C20-Camera").apply { start() }
+    private val imageThread = HandlerThread("OmniCam-C20-RawCopy").apply { start() }
+    private val previewThread = HandlerThread("OmniCam-C20-JpegPreview").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
     private val imageHandler = Handler(imageThread.looper)
     private val previewHandler = Handler(previewThread.looper)
-    private val scratchDir = java.io.File(appContext.cacheDir, "computational-raw")
+    private val scratchDir = File(appContext.cacheDir, "computational-raw")
     private val engine = ComputationalRawEngine(cameraHandler, imageHandler, scratchDir)
 
     private val coordinatorDispatcher = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "OmniCam-C19-DngQueue").apply {
+        Thread(runnable, "OmniCam-C20-DngQueue").apply {
             priority = (Thread.NORM_PRIORITY - 1).coerceAtLeast(Thread.MIN_PRIORITY)
         }
     }.asCoroutineDispatcher()
@@ -117,14 +123,17 @@ class LightningRawController(context: Context) {
     private val queue = Channel<PostJob>(MAX_PENDING_JOBS)
     private val captureMutex = Mutex()
     private val idGenerator = AtomicLong(System.currentTimeMillis())
+    private val focusGeneration = AtomicLong(0)
     private val jobsLock = Any()
 
     private val _jobs = MutableStateFlow<List<LightningRawJobStatus>>(emptyList())
     val jobs: StateFlow<List<LightningRawJobStatus>> = _jobs.asStateFlow()
     private val _cameraState = MutableStateFlow(LightningCameraState())
     val cameraState: StateFlow<LightningCameraState> = _cameraState.asStateFlow()
-    private val _previewFrame = MutableStateFlow<YuvPreviewFrame?>(null)
-    val previewFrame: StateFlow<YuvPreviewFrame?> = _previewFrame.asStateFlow()
+    private val _previewFrame = MutableStateFlow<JpegPreviewFrame?>(null)
+    val previewFrame: StateFlow<JpegPreviewFrame?> = _previewFrame.asStateFlow()
+    private val _focusState = MutableStateFlow(LightningFocusState())
+    val focusState: StateFlow<LightningFocusState> = _focusState.asStateFlow()
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -134,8 +143,10 @@ class LightningRawController(context: Context) {
     private var activeRoute: ValuableCameraRoute? = null
     private var activeCharacteristics: CameraCharacteristics? = null
     private var activeCandidate: RawCandidate? = null
+    private var activeSpec: ComputationalRawViewfinderSpec? = null
+    private var requestedFlashMode = LightningFlashMode.OFF
     @Volatile private var latestPreviewResult: TotalCaptureResult? = null
-    @Volatile private var lastPreviewFrameNs: Long = 0L
+    @Volatile private var latestPreviewBitmap: Bitmap? = null
 
     init {
         engine.clearStaleScratch()
@@ -164,6 +175,7 @@ class LightningRawController(context: Context) {
             previewSize = previewSize,
             rotationDegrees = rotation,
             mirrorX = front,
+            targetAspect = targetAspect,
         )
     }
 
@@ -177,7 +189,12 @@ class LightningRawController(context: Context) {
             return@withContext ComputationalRawBindResult.Failure(route.camera.id, "Direct RAW_SENSOR route required")
         }
         val chars = runCatching { cameraManager.getCameraCharacteristics(route.camera.id) }
-            .getOrElse { return@withContext ComputationalRawBindResult.Failure(route.camera.id, it.message ?: "Camera unavailable") }
+            .getOrElse {
+                return@withContext ComputationalRawBindResult.Failure(
+                    route.camera.id,
+                    it.message ?: "Camera unavailable",
+                )
+            }
         val candidates = rawCandidates(chars)
         if (candidates.isEmpty()) {
             return@withContext ComputationalRawBindResult.Failure(route.camera.id, "No RAW_SENSOR size")
@@ -190,7 +207,7 @@ class LightningRawController(context: Context) {
             attempt.onSuccess { return@withContext it }
             last = attempt.exceptionOrNull()
         }
-        ComputationalRawBindResult.Failure(route.camera.id, last?.message ?: "YUV preview + RAW session rejected")
+        ComputationalRawBindResult.Failure(route.camera.id, last?.message ?: "JPEG preview + RAW session rejected")
     }
 
     @SuppressLint("MissingPermission")
@@ -200,37 +217,45 @@ class LightningRawController(context: Context) {
         chars: CameraCharacteristics,
         candidate: RawCandidate,
     ): ComputationalRawBindResult.Success {
-        val yuv = ImageReader.newInstance(
+        val jpeg = ImageReader.newInstance(
             spec.previewSize.width,
             spec.previewSize.height,
-            ImageFormat.YUV_420_888,
-            3,
+            ImageFormat.JPEG,
+            2,
         )
         val raw = ImageReader.newInstance(candidate.size.width, candidate.size.height, ImageFormat.RAW_SENSOR, 4)
-        previewReader = yuv
+        previewReader = jpeg
         rawReader = raw
         activeRoute = route
         activeCharacteristics = chars
         activeCandidate = candidate
+        activeSpec = spec
         latestPreviewResult = null
-        lastPreviewFrameNs = 0L
-        attachPreviewReader(yuv, spec)
+        latestPreviewBitmap = null
+        attachPreviewReader(jpeg, spec)
 
         val device = openCamera(route.camera.id)
         cameraDevice = device
-        val session = createSession(device, yuv.surface, raw.surface)
+        val session = createSession(device, jpeg.surface, raw.surface)
         captureSession = session
         val zoom = zoomRange(chars)
+        val flashAvailable = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        val effectiveFlash = if (flashAvailable) requestedFlashMode else LightningFlashMode.OFF
         _cameraState.value = LightningCameraState(
             cameraId = route.camera.id,
             minZoomRatio = zoom.first,
             maxZoomRatio = zoom.second,
             zoomRatio = 1f.coerceIn(zoom.first, zoom.second),
+            flashAvailable = flashAvailable,
+            flashMode = effectiveFlash,
         )
 
         val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-            addTarget(yuv.surface)
+            addTarget(jpeg.surface)
+            set(CaptureRequest.JPEG_QUALITY, JPEG_PREVIEW_QUALITY)
+            set(CaptureRequest.JPEG_ORIENTATION, spec.rotationDegrees)
             applyProcessedPreviewDefaults(this, chars)
+            applyPreviewFlash(this, chars, effectiveFlash)
         }
         previewBuilder = builder
         session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler)
@@ -246,15 +271,11 @@ class LightningRawController(context: Context) {
         reader.setOnImageAvailableListener({ source ->
             val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
             image.use { frame ->
-                val timestamp = frame.timestamp
-                if (lastPreviewFrameNs != 0L && timestamp - lastPreviewFrameNs < PREVIEW_INTERVAL_NS) {
-                    return@use
-                }
-                lastPreviewFrameNs = timestamp
                 runCatching {
-                    YuvPreviewConverter.toBitmap(frame, spec.rotationDegrees, spec.mirrorX)
+                    JpegPreviewDecoder.decode(frame, spec.rotationDegrees, spec.mirrorX)
                 }.onSuccess { bitmap ->
-                    _previewFrame.value = YuvPreviewFrame(bitmap, timestamp)
+                    latestPreviewBitmap = bitmap
+                    _previewFrame.value = JpegPreviewFrame(bitmap, frame.timestamp)
                 }
             }
         }, previewHandler)
@@ -275,12 +296,71 @@ class LightningRawController(context: Context) {
         return clamped
     }
 
+    fun setFlashMode(mode: LightningFlashMode): LightningFlashMode {
+        requestedFlashMode = mode
+        val state = _cameraState.value
+        val effective = if (state.flashAvailable) mode else LightningFlashMode.OFF
+        _cameraState.value = state.copy(flashMode = effective)
+        val chars = activeCharacteristics ?: return effective
+        cameraHandler.post {
+            val builder = previewBuilder ?: return@post
+            val session = captureSession ?: return@post
+            applyPreviewFlash(builder, chars, effective)
+            runCatching { session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler) }
+        }
+        return effective
+    }
+
+    fun focusAt(normalizedX: Float, normalizedY: Float): Boolean {
+        val chars = activeCharacteristics ?: return false
+        val spec = activeSpec ?: return false
+        val session = captureSession ?: return false
+        val builder = previewBuilder ?: return false
+        if ((chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) <= 0) return false
+
+        val displayX = normalizedX.coerceIn(0f, 1f)
+        val displayY = normalizedY.coerceIn(0f, 1f)
+        val sensorPoint = displayToSensor(displayX, displayY, spec)
+        val bounds = meteringBounds(chars, spec, _cameraState.value.zoomRatio)
+        val centerX = bounds.left + (sensorPoint.first * bounds.width()).roundToInt()
+        val centerY = bounds.top + (sensorPoint.second * bounds.height()).roundToInt()
+        val half = (min(bounds.width(), bounds.height()) * 0.075f).roundToInt().coerceAtLeast(24)
+        val left = (centerX - half).coerceIn(bounds.left, max(bounds.left, bounds.right - 2))
+        val top = (centerY - half).coerceIn(bounds.top, max(bounds.top, bounds.bottom - 2))
+        val right = (centerX + half).coerceIn(left + 1, bounds.right)
+        val bottom = (centerY + half).coerceIn(top + 1, bounds.bottom)
+        val region = MeteringRectangle(Rect(left, top, right, bottom), MeteringRectangle.METERING_WEIGHT_MAX)
+        val generation = focusGeneration.incrementAndGet()
+        _focusState.value = LightningFocusState(displayX, displayY, LightningFocusStatus.SCANNING)
+
+        cameraHandler.post {
+            runCatching {
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+                if ((chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) {
+                    builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+                }
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+                session.capture(builder.build(), previewCaptureCallback, cameraHandler)
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+                session.capture(builder.build(), previewCaptureCallback, cameraHandler)
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler)
+            }.onFailure {
+                _focusState.value = LightningFocusState(displayX, displayY, LightningFocusStatus.FAILED)
+            }
+        }
+        cameraHandler.postDelayed({ restoreContinuousFocus(generation) }, FOCUS_TIMEOUT_MS)
+        return true
+    }
+
     suspend fun capture(
         preset: ComputationalRawPreset,
         tuning: LightningRawTuning,
         onProgress: (String) -> Unit = {},
     ): LightningCaptureResult {
         if (!captureMutex.tryLock()) return LightningCaptureResult.Failure("RAW burst already capturing")
+        var temporaryTorch = false
         try {
             if (activeJobCount() >= MAX_PENDING_JOBS) return LightningCaptureResult.Failure("Processing queue full")
             activeRoute ?: return LightningCaptureResult.Failure("Camera not ready")
@@ -293,11 +373,22 @@ class LightningRawController(context: Context) {
             val started = android.os.SystemClock.elapsedRealtime()
 
             return runCatching {
+                val initial = latestPreviewResult ?: awaitReferenceResult(session)
+                val flashMode = _cameraState.value.flashMode
+                val flashDuringBurst = shouldIlluminateBurst(flashMode, initial)
+                if (flashDuringBurst && flashMode != LightningFlashMode.TORCH) {
+                    onProgress("Preparing flash")
+                    applyPreviewFlashNow(LightningFlashMode.TORCH)
+                    temporaryTorch = true
+                    delay(FLASH_METERING_DELAY_MS)
+                }
+
                 val reference = latestPreviewResult ?: awaitReferenceResult(session)
                 val baseExposure = reference.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: DEFAULT_EXPOSURE_NS
                 val baseIso = reference.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
                 val focus = reference.get(CaptureResult.LENS_FOCUS_DISTANCE)
-                onProgress("Capturing ${preset.frameCount} RAW")
+                onProgress("Capturing ${preset.frameCount} native RAW")
+                runCatching { session.stopRepeating() }
 
                 val burst = engine.captureToScratch(
                     device = device,
@@ -311,16 +402,19 @@ class LightningRawController(context: Context) {
                     baseIso = baseIso,
                     baseExposureTimeNs = baseExposure,
                     lockedFocusDistanceDiopters = focus,
-                    applyCommonSettings = { builder ->
-                        builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                        builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-                        builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
-                        builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE)
-                        applyZoom(builder, chars, capturedZoom)
+                    applyCommonSettings = { captureBuilder ->
+                        captureBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                        captureBuilder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                        captureBuilder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE)
+                        captureBuilder.set(
+                            CaptureRequest.FLASH_MODE,
+                            if (flashDuringBurst) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF,
+                        )
+                        applyZoom(captureBuilder, chars, capturedZoom)
                     },
-                    applySensorPixelMode = { builder ->
+                    applySensorPixelMode = { captureBuilder ->
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                            builder.set(
+                            captureBuilder.set(
                                 CaptureRequest.SENSOR_PIXEL_MODE,
                                 if (candidate.maximumResolutionMode) CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION
                                 else CameraMetadata.SENSOR_PIXEL_MODE_DEFAULT,
@@ -329,9 +423,23 @@ class LightningRawController(context: Context) {
                     },
                 )
 
+                if (temporaryTorch) {
+                    applyPreviewFlashNow(requestedFlashMode)
+                    temporaryTorch = false
+                } else {
+                    resumePreview()
+                }
+
                 val captureMillis = android.os.SystemClock.elapsedRealtime() - started
                 val id = idGenerator.incrementAndGet()
-                val post = PostJob(id, burst, preset, tuning.copy(), capturedZoom)
+                val post = PostJob(
+                    id = id,
+                    burst = burst,
+                    preset = preset,
+                    tuning = tuning.copy(),
+                    zoomRatio = capturedZoom,
+                    thumbnail = snapshotThumbnail(),
+                )
                 addJob(
                     LightningRawJobStatus(
                         id = id,
@@ -346,13 +454,23 @@ class LightningRawController(context: Context) {
                 )
                 if (!queue.trySend(post).isSuccess) {
                     removeJob(id)
+                    post.thumbnail?.recycle()
                     engine.discardCaptured(burst)
                     error("Processing queue rejected capture")
                 }
                 onProgress("DNG processing · shutter ready")
                 LightningCaptureResult.Queued(burst.width, burst.height, burst.frameCount, captureMillis)
             }.getOrElse { error ->
-                runCatching { resumePreview() }
+                if (temporaryTorch) {
+                    try {
+                        applyPreviewFlashNow(requestedFlashMode)
+                    } catch (_: Throwable) {
+                        resumePreview()
+                    }
+                    temporaryTorch = false
+                } else {
+                    resumePreview()
+                }
                 LightningCaptureResult.Failure(error.message ?: error::class.java.simpleName)
             }
         } finally {
@@ -380,7 +498,9 @@ class LightningRawController(context: Context) {
                     upscaleFactor = job.tuning.upscaleFactor,
                 )
             }
-            val uri = withContext(Dispatchers.IO) { saveDng(fusion.merged, transformed, job) }
+            val uri = withContext(Dispatchers.IO) {
+                saveDng(fusion.merged, transformed, job)
+            }
             updateJob(job.id) {
                 it.copy(
                     stage = LightningJobStage.SAVED,
@@ -397,6 +517,7 @@ class LightningRawController(context: Context) {
                 it.copy(stage = LightningJobStage.FAILED, message = error.message ?: error::class.java.simpleName)
             }
         } finally {
+            job.thumbnail?.recycle()
             engine.discardCaptured(job.burst)
             trimJobHistory()
         }
@@ -414,12 +535,25 @@ class LightningRawController(context: Context) {
         previewThread.quitSafely()
     }
 
+    private fun snapshotThumbnail(): Bitmap? {
+        val source = latestPreviewBitmap ?: return null
+        val maxSide = max(source.width, source.height)
+        if (maxSide <= 256) return source.copy(Bitmap.Config.ARGB_8888, false)
+        val scale = 256f / maxSide
+        return runCatching {
+            Bitmap.createScaledBitmap(
+                source,
+                (source.width * scale).roundToInt().coerceAtLeast(1),
+                (source.height * scale).roundToInt().coerceAtLeast(1),
+                true,
+            )
+        }.getOrNull()
+    }
+
     private fun applyProcessedPreviewDefaults(builder: CaptureRequest.Builder, chars: CameraCharacteristics) {
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CaptureRequest.CONTROL_CAPTURE_INTENT_PREVIEW)
-        builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
         if (chars.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true) {
             builder.set(CaptureRequest.CONTROL_AE_LOCK, false)
         }
@@ -427,7 +561,6 @@ class LightningRawController(context: Context) {
             builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
         }
         choosePreviewFps(chars)?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
-
         val antibanding = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES).orEmpty()
         if (antibanding.contains(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO)) {
             builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO)
@@ -444,17 +577,95 @@ class LightningRawController(context: Context) {
                 builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
         }
         val edgeModes = chars.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES).orEmpty()
-        if (edgeModes.contains(CaptureRequest.EDGE_MODE_FAST)) {
-            builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+        when {
+            edgeModes.contains(CaptureRequest.EDGE_MODE_FAST) -> builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+            edgeModes.contains(CaptureRequest.EDGE_MODE_HIGH_QUALITY) -> builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
         }
         setContinuousAfIfSupported(builder, chars)
         applyZoom(builder, chars, _cameraState.value.zoomRatio)
     }
 
+    private fun applyPreviewFlash(
+        builder: CaptureRequest.Builder,
+        chars: CameraCharacteristics,
+        mode: LightningFlashMode,
+    ) {
+        val available = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        if (!available) {
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+            return
+        }
+        val aeModes = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES).orEmpty()
+        when (mode) {
+            LightningFlashMode.OFF -> {
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+            }
+            LightningFlashMode.AUTO -> {
+                builder.set(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    if (aeModes.contains(CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)) {
+                        CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH
+                    } else {
+                        CaptureRequest.CONTROL_AE_MODE_ON
+                    },
+                )
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+            }
+            LightningFlashMode.ON -> {
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+            }
+            LightningFlashMode.TORCH -> {
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+            }
+        }
+    }
+
+    private suspend fun applyPreviewFlashNow(mode: LightningFlashMode) {
+        val chars = activeCharacteristics ?: return
+        val effective = if (_cameraState.value.flashAvailable) mode else LightningFlashMode.OFF
+        suspendCancellableCoroutine { continuation ->
+            cameraHandler.post {
+                val builder = previewBuilder
+                val session = captureSession
+                if (builder == null || session == null) {
+                    if (continuation.isActive) continuation.resume(Unit)
+                    return@post
+                }
+                runCatching {
+                    applyPreviewFlash(builder, chars, effective)
+                    session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler)
+                }.onSuccess {
+                    if (continuation.isActive) continuation.resume(Unit)
+                }.onFailure {
+                    if (continuation.isActive) continuation.resumeWithException(it)
+                }
+            }
+        }
+    }
+
+    private fun shouldIlluminateBurst(mode: LightningFlashMode, result: TotalCaptureResult): Boolean {
+        if (!_cameraState.value.flashAvailable) return false
+        return when (mode) {
+            LightningFlashMode.OFF -> false
+            LightningFlashMode.ON, LightningFlashMode.TORCH -> true
+            LightningFlashMode.AUTO -> {
+                val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+                aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+                    (result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0) >= AUTO_FLASH_ISO ||
+                    (result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L) >= AUTO_FLASH_EXPOSURE_NS
+            }
+        }
+    }
+
     private fun choosePreviewFps(chars: CameraCharacteristics): Range<Int>? {
         val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
-        return ranges.firstOrNull { it.lower == 30 && it.upper == 30 }
-            ?: ranges.filter { it.upper == 30 }.maxByOrNull { it.lower }
+        return ranges.firstOrNull { it.lower <= 15 && it.upper == 30 && it.lower >= 10 }
+            ?: ranges.firstOrNull { it.lower <= 24 && it.upper == 30 }
+            ?: ranges.firstOrNull { it.lower == 30 && it.upper == 30 }
             ?: ranges.filter { it.upper >= 30 }
                 .minWithOrNull(compareBy<Range<Int>> { abs(it.upper - 30) }.thenByDescending { it.lower })
             ?: ranges.maxByOrNull { it.upper }
@@ -502,6 +713,87 @@ class LightningRawController(context: Context) {
             result: TotalCaptureResult,
         ) {
             latestPreviewResult = result
+            val focus = _focusState.value
+            if (focus.status == LightningFocusStatus.SCANNING) {
+                when (result.get(CaptureResult.CONTROL_AF_STATE)) {
+                    CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED,
+                    CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED,
+                    -> _focusState.value = focus.copy(status = LightningFocusStatus.FOCUSED)
+                    CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ->
+                        _focusState.value = focus.copy(status = LightningFocusStatus.FAILED)
+                }
+            }
+        }
+    }
+
+    private fun restoreContinuousFocus(generation: Long) {
+        if (focusGeneration.get() != generation) return
+        val chars = activeCharacteristics ?: return
+        val builder = previewBuilder ?: return
+        val session = captureSession ?: return
+        runCatching {
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            session.capture(builder.build(), previewCaptureCallback, cameraHandler)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            setContinuousAfIfSupported(builder, chars)
+            session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler)
+        }
+        val state = _focusState.value
+        if (state.status == LightningFocusStatus.SCANNING) {
+            _focusState.value = state.copy(status = LightningFocusStatus.FAILED)
+        }
+        cameraHandler.postDelayed({
+            if (focusGeneration.get() == generation) _focusState.value = LightningFocusState()
+        }, FOCUS_INDICATOR_HOLD_MS)
+    }
+
+    private fun displayToSensor(
+        displayX: Float,
+        displayY: Float,
+        spec: ComputationalRawViewfinderSpec,
+    ): Pair<Float, Float> {
+        var x = displayX
+        val y = displayY
+        if (spec.mirrorX) x = 1f - x
+        return when (((spec.rotationDegrees % 360) + 360) % 360) {
+            90 -> y to (1f - x)
+            180 -> (1f - x) to (1f - y)
+            270 -> (1f - y) to x
+            else -> x to y
+        }
+    }
+
+    private fun meteringBounds(
+        chars: CameraCharacteristics,
+        spec: ComputationalRawViewfinderSpec,
+        zoom: Float,
+    ): Rect {
+        val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            ?: Rect(0, 0, spec.previewSize.width, spec.previewSize.height)
+        var bounds = cropRectToAspect(active, spec.targetAspect)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R && zoom > 1.001f) {
+            val width = (bounds.width() / zoom).roundToInt().coerceAtLeast(2)
+            val height = (bounds.height() / zoom).roundToInt().coerceAtLeast(2)
+            val left = bounds.left + (bounds.width() - width) / 2
+            val top = bounds.top + (bounds.height() - height) / 2
+            bounds = Rect(left, top, left + width, top + height)
+        }
+        return bounds
+    }
+
+    private fun cropRectToAspect(source: Rect, targetAspect: Float?): Rect {
+        val aspect = targetAspect?.takeIf { it.isFinite() && it > 0f } ?: return Rect(source)
+        val current = source.width().toFloat() / source.height()
+        return if (current > aspect) {
+            val width = (source.height() * aspect).roundToInt().coerceAtLeast(2)
+            val left = source.left + (source.width() - width) / 2
+            Rect(left, source.top, left + width, source.bottom)
+        } else if (current < aspect) {
+            val height = (source.width() / aspect).roundToInt().coerceAtLeast(2)
+            val top = source.top + (source.height() - height) / 2
+            Rect(source.left, top, source.right, top + height)
+        } else {
+            Rect(source)
         }
     }
 
@@ -550,21 +842,19 @@ class LightningRawController(context: Context) {
         }
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             ?: error("Could not create DNG")
+        val temp = File.createTempFile("omnicam_output_", ".dng", appContext.cacheDir)
         try {
+            AdaptiveDngWriter.write(
+                file = temp,
+                merged = merged,
+                transformed = transformed,
+                thumbnail = job.thumbnail,
+                description = "OmniCam C2.0 ${job.preset.name}; zoom=${String.format(Locale.US, "%.2f", job.zoomRatio)}x; " +
+                    "upscale=${String.format(Locale.US, "%.2f", transformed.scale)}x; " +
+                    "crop=${transformed.cropLeft},${transformed.cropTop}; JPEG-preview",
+            )
             resolver.openOutputStream(uri, "w")?.use { output ->
-                android.hardware.camera2.DngCreator(merged.referenceCharacteristics, merged.referenceResult).use { creator ->
-                    creator.setDescription(
-                        "OmniCam C1.9 ${job.preset.name} DNG; zoom=${String.format(Locale.US, "%.2f", job.zoomRatio)}x; " +
-                            "enhanced=${String.format(Locale.US, "%.2f", transformed.scale)}x; " +
-                            "crop=${transformed.cropLeft},${transformed.cropTop}",
-                    )
-                    creator.writeByteBuffer(
-                        output,
-                        Size(transformed.width, transformed.height),
-                        transformed.pixels16.duplicate(),
-                        0,
-                    )
-                }
+                temp.inputStream().buffered().use { input -> input.copyTo(output, 1024 * 1024) }
             } ?: error("DNG output unavailable")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 resolver.update(
@@ -578,6 +868,8 @@ class LightningRawController(context: Context) {
         } catch (error: Throwable) {
             resolver.delete(uri, null, null)
             throw error
+        } finally {
+            temp.delete()
         }
     }
 
@@ -622,19 +914,32 @@ class LightningRawController(context: Context) {
     }
 
     private fun choosePreviewSize(chars: CameraCharacteristics, targetAspect: Float?): Size {
-        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return Size(1280, 960)
-        val sizes = runCatching { map.getOutputSizes(ImageFormat.YUV_420_888) }.getOrNull().orEmpty()
-        val bounded = sizes.filter {
-            max(it.width, it.height) <= 1440 && pixels(it) <= 1_600_000L
-        }.ifEmpty { sizes.toList() }
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: error("No camera stream configuration map")
+        val sizes = runCatching { map.getOutputSizes(ImageFormat.JPEG) }.getOrNull().orEmpty()
+        require(sizes.isNotEmpty()) { "Camera does not expose JPEG output" }
         val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         val aspect = targetAspect?.takeIf { it.isFinite() && it > 0f }
             ?: active?.let { it.width().toFloat() / it.height().toFloat() }
             ?: 4f / 3f
+        val bounded = sizes.filter {
+            max(it.width, it.height) <= 1600 &&
+                min(it.width, it.height) >= 480 &&
+                pixels(it) <= 1_600_000L
+        }.ifEmpty {
+            sizes.filter { pixels(it) <= 2_500_000L }.ifEmpty { sizes.toList() }
+        }
         return bounded.minWithOrNull(
             compareBy<Size> { abs(it.width.toFloat() / it.height - aspect) }
-                .thenByDescending(::pixels),
-        ) ?: Size(1280, 960)
+                .thenBy { jpegFrameCost(map, it) }
+                .thenBy { abs(pixels(it) - 1_000_000L) },
+        ) ?: sizes.minBy(::pixels)
+    }
+
+    private fun jpegFrameCost(map: android.hardware.camera2.params.StreamConfigurationMap, size: Size): Long {
+        val minFrame = runCatching { map.getOutputMinFrameDuration(ImageFormat.JPEG, size) }.getOrDefault(0L)
+        val stall = runCatching { map.getOutputStallDuration(ImageFormat.JPEG, size) }.getOrDefault(0L)
+        return minFrame.coerceAtLeast(0L) + stall.coerceAtLeast(0L)
     }
 
     private fun setContinuousAfIfSupported(builder: CaptureRequest.Builder, chars: CameraCharacteristics) {
@@ -644,6 +949,7 @@ class LightningRawController(context: Context) {
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             modes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) ->
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            else -> builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
         }
     }
 
@@ -677,8 +983,8 @@ class LightningRawController(context: Context) {
     @Suppress("DEPRECATION")
     private suspend fun createSession(
         device: CameraDevice,
-        preview: Surface,
-        raw: Surface,
+        preview: android.view.Surface,
+        raw: android.view.Surface,
     ): CameraCaptureSession = suspendCancellableCoroutine { continuation ->
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
@@ -688,7 +994,7 @@ class LightningRawController(context: Context) {
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 session.close()
                 if (continuation.isActive) {
-                    continuation.resumeWithException(IllegalStateException("YUV preview + RAW session rejected"))
+                    continuation.resumeWithException(IllegalStateException("JPEG preview + RAW session rejected"))
                 }
             }
         }
@@ -697,6 +1003,7 @@ class LightningRawController(context: Context) {
     }
 
     private fun closeCurrent() {
+        focusGeneration.incrementAndGet()
         runCatching { captureSession?.stopRepeating() }
         runCatching { captureSession?.abortCaptures() }
         runCatching { captureSession?.close() }
@@ -711,10 +1018,12 @@ class LightningRawController(context: Context) {
         activeRoute = null
         activeCharacteristics = null
         activeCandidate = null
+        activeSpec = null
         latestPreviewResult = null
-        lastPreviewFrameNs = 0L
+        latestPreviewBitmap = null
         _previewFrame.value = null
-        _cameraState.value = LightningCameraState()
+        _focusState.value = LightningFocusState()
+        _cameraState.value = LightningCameraState(flashMode = requestedFlashMode)
     }
 
     private fun pixels(size: Size): Long = size.width.toLong() * size.height.toLong()
@@ -727,13 +1036,19 @@ class LightningRawController(context: Context) {
         val preset: ComputationalRawPreset,
         val tuning: LightningRawTuning,
         val zoomRatio: Float,
+        val thumbnail: Bitmap?,
     )
 
     private companion object {
         const val MAX_PENDING_JOBS = 3
         const val MAX_JOB_HISTORY = 7
         const val DEFAULT_EXPOSURE_NS = 16_666_667L
-        const val PREVIEW_INTERVAL_NS = 41_000_000L
         const val MAX_UPSCALE_FACTOR = 3f
+        const val AUTO_FLASH_ISO = 800
+        const val AUTO_FLASH_EXPOSURE_NS = 28_000_000L
+        const val FLASH_METERING_DELAY_MS = 180L
+        const val FOCUS_TIMEOUT_MS = 1_600L
+        const val FOCUS_INDICATOR_HOLD_MS = 700L
+        const val JPEG_PREVIEW_QUALITY: Byte = 88.toByte()
     }
 }
