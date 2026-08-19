@@ -46,7 +46,7 @@ internal object RawDngTransform {
         cropHeight = min(cropHeight, sourceHeight)
         val left = evenFloor((sourceWidth - cropWidth) / 2)
         val top = evenFloor((sourceHeight - cropHeight) / 2)
-        val factor = upscaleFactor.coerceIn(1f, 2f)
+        val factor = upscaleFactor.coerceIn(1f, 3f)
         val outputWidth = evenFloor((cropWidth * factor).roundToInt()).coerceAtLeast(4)
         val outputHeight = evenFloor((cropHeight * factor).roundToInt()).coerceAtLeast(4)
 
