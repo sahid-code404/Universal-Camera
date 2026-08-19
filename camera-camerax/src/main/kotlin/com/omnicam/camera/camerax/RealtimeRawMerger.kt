@@ -231,8 +231,6 @@ internal object RealtimeRawMerger {
                         continue
                     }
 
-                    // Shorter bracket frames are useful for highlight recovery but become noisy when
-                    // amplified into ordinary shadows. Same-exposure temporal frames always remain.
                     if (!candidate.sameExposure && ref < HIGHLIGHT_USE_Q16) continue
 
                     val source = candidate.normalizedQ16(sx, sy)
@@ -456,47 +454,45 @@ internal object RealtimeRawMerger {
 
     private fun even(value: Int): Int = value - (value and 1)
 
-    private companion object {
-        const val BYTES_PER_PIXEL = 2
-        const val CFA_PERIOD = 2
-        const val NORMALIZE_SHIFT = 20
-        const val FULL_SCALE = 65535
-        const val HALF_SCALE = 32768L
-        const val Q16 = 65536.0
+    private const val BYTES_PER_PIXEL = 2
+    private const val CFA_PERIOD = 2
+    private const val NORMALIZE_SHIFT = 20
+    private const val FULL_SCALE = 65535
+    private const val HALF_SCALE = 32768L
+    private const val Q16 = 65536.0
 
-        const val MAX_BACKGROUND_MERGE_THREADS = 3
-        const val YIELD_ROW_MASK = 63
+    private const val MAX_BACKGROUND_MERGE_THREADS = 3
+    private const val YIELD_ROW_MASK = 63
 
-        const val REFERENCE_WEIGHT = 4
-        const val SAME_EXPOSURE_WEIGHT = 4
-        const val BRACKET_WEIGHT = 1
-        const val SAME_EXPOSURE_MIN = 0.82
-        const val SAME_EXPOSURE_MAX = 1.22
-        const val HIGHLIGHT_USE_Q16 = 50_000
-        const val SOURCE_CLIP_Q16 = 64_000
-        const val SOURCE_BLACK_Q16 = 160
+    private const val REFERENCE_WEIGHT = 4
+    private const val SAME_EXPOSURE_WEIGHT = 4
+    private const val BRACKET_WEIGHT = 1
+    private const val SAME_EXPOSURE_MIN = 0.82
+    private const val SAME_EXPOSURE_MAX = 1.22
+    private const val HIGHLIGHT_USE_Q16 = 50_000
+    private const val SOURCE_CLIP_Q16 = 64_000
+    private const val SOURCE_BLACK_Q16 = 160
 
-        const val HARD_ALIGNMENT_REJECT_CONFIDENCE = 0.08f
-        const val MEDIUM_ALIGNMENT_CONFIDENCE = 0.30f
-        const val COARSE_RADIUS = 12
-        const val REFINE_RADIUS = 2
-        const val COARSE_SAMPLE_STEP = 48
-        const val REFINE_SAMPLE_STEP = 20
-        const val ALIGNMENT_BORDER = 64
-        const val MIN_ALIGNMENT_SAMPLES = 128
-        const val ALIGNMENT_BAD_RESIDUAL = 0.10
-        const val ALIGNMENT_DARK_Q16 = 650
-        const val ALIGNMENT_LIGHT_Q16 = 62_000
+    private const val HARD_ALIGNMENT_REJECT_CONFIDENCE = 0.08f
+    private const val MEDIUM_ALIGNMENT_CONFIDENCE = 0.30f
+    private const val COARSE_RADIUS = 12
+    private const val REFINE_RADIUS = 2
+    private const val COARSE_SAMPLE_STEP = 48
+    private const val REFINE_SAMPLE_STEP = 20
+    private const val ALIGNMENT_BORDER = 64
+    private const val MIN_ALIGNMENT_SAMPLES = 128
+    private const val ALIGNMENT_BAD_RESIDUAL = 0.10
+    private const val ALIGNMENT_DARK_Q16 = 650
+    private const val ALIGNMENT_LIGHT_Q16 = 62_000
 
-        const val LUT_SIZE = 256
-        const val LUT_BUCKET_SHIFT = 8
-        const val MIN_VARIANCE = 1e-9
-        const val FALLBACK_READ_VARIANCE = 0.000025
-        const val FALLBACK_SHOT_FACTOR = 0.0016
-        const val NOISE_SIGMA_MULTIPLIER = 3.5
-        const val MIN_MOTION_THRESHOLD = 0.018
-        const val BRIGHT_MOTION_ALLOWANCE = 0.035
-        const val MIN_THRESHOLD_Q16 = 900
-        const val MAX_THRESHOLD_Q16 = 12_000
-    }
+    private const val LUT_SIZE = 256
+    private const val LUT_BUCKET_SHIFT = 8
+    private const val MIN_VARIANCE = 1e-9
+    private const val FALLBACK_READ_VARIANCE = 0.000025
+    private const val FALLBACK_SHOT_FACTOR = 0.0016
+    private const val NOISE_SIGMA_MULTIPLIER = 3.5
+    private const val MIN_MOTION_THRESHOLD = 0.018
+    private const val BRIGHT_MOTION_ALLOWANCE = 0.035
+    private const val MIN_THRESHOLD_Q16 = 900
+    private const val MAX_THRESHOLD_Q16 = 12_000
 }
