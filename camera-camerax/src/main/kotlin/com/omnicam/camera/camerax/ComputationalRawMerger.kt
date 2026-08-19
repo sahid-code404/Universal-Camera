@@ -61,7 +61,7 @@ internal object ComputationalRawMerger {
     private data class MappedFrame(
         val frame: Frame,
         val buffer: ByteBuffer,
-        val noiseProfile: Array<Pair<Double, Double>>?,
+        val noiseProfile: Array<android.util.Pair<Double, Double>>?,
     ) {
         fun fork(): MappedFrame = copy(buffer = buffer.duplicate().order(ByteOrder.nativeOrder()))
 
@@ -253,8 +253,6 @@ internal object ComputationalRawMerger {
     }
 
     private fun chooseReference(frames: List<Frame>): Int {
-        // Prefer the longest exposure, then lowest ISO. This maximizes reference SNR while bracket
-        // frames are still available to recover highlights that clip in the reference.
         return frames.indices.maxWithOrNull(
             compareBy<Int> { frames[it].exposureTimeNs }
                 .thenByDescending { -frames[it].iso },
@@ -282,8 +280,6 @@ internal object ComputationalRawMerger {
             sampleStep = REFINE_SAMPLE_STEP,
         )
 
-        // Absolute residual is much more meaningful than best-vs-second separation in low-detail
-        // regions where several neighbouring translations can legitimately have nearly equal cost.
         val residualConfidence = exp(-refined.score / ALIGNMENT_RESIDUAL_SCALE)
         val separation = if (refined.secondScore.isFinite() && refined.secondScore > 1e-9) {
             ((refined.secondScore - refined.score) / refined.secondScore).coerceIn(0.0, 1.0)
@@ -340,8 +336,6 @@ internal object ComputationalRawMerger {
                         if (cx >= 0 && cy >= 0 && cx + 1 < candidate.frame.width && cy + 1 < candidate.frame.height) {
                             val a = blockLuma(reference, x, y)
                             val b = blockLuma(candidate, cx, cy) * scale
-                            // Ignore nearly black and strongly clipped blocks; they have poor
-                            // registration information and bias HDR-bracket alignment.
                             if (a > ALIGNMENT_DARK_FLOOR && b > ALIGNMENT_DARK_FLOOR &&
                                 a < ALIGNMENT_CLIP_CEILING && b < ALIGNMENT_CLIP_CEILING
                             ) {
@@ -398,7 +392,6 @@ internal object ComputationalRawMerger {
             return (pair.first * signal.coerceAtLeast(0.0) + pair.second)
                 .coerceAtLeast(MIN_VARIANCE)
         }
-        // Conservative fallback: read-noise floor plus shot noise. Only relative weights matter.
         return (FALLBACK_READ_VARIANCE + FALLBACK_SHOT_FACTOR * signal.coerceAtLeast(0.0))
             .coerceAtLeast(MIN_VARIANCE)
     }
@@ -411,10 +404,10 @@ internal object ComputationalRawMerger {
         val py = y and 1
         return when (arrangement) {
             CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GRBG -> when {
-                py == 0 && px == 0 -> 1 // G even
-                py == 0 -> 0 // R
-                py == 1 && px == 0 -> 3 // B
-                else -> 2 // G odd
+                py == 0 && px == 0 -> 1
+                py == 0 -> 0
+                py == 1 && px == 0 -> 3
+                else -> 2
             }
             CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG -> when {
                 py == 0 && px == 0 -> 1
@@ -428,7 +421,7 @@ internal object ComputationalRawMerger {
                 py == 1 && px == 0 -> 2
                 else -> 0
             }
-            else -> when { // RGGB
+            else -> when {
                 py == 0 && px == 0 -> 0
                 py == 0 -> 1
                 py == 1 && px == 0 -> 2
