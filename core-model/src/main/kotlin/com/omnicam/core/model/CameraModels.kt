@@ -86,12 +86,30 @@ data class LogicalCameraGroup(
     val physicalCameraIds: List<String>,
 )
 
+data class LegacyCameraDescriptor(
+    val index: Int,
+    val lensFacing: LensFacing,
+    val orientationDegrees: Int,
+)
+
+enum class PublicCameraExposureAssessment {
+    MULTIPLE_CAMERA2_IDS,
+    LOGICAL_MULTI_CAMERA_EXPOSED,
+    LEGACY_API_SEES_ADDITIONAL_CAMERAS,
+    AUXILIARY_NOT_EXPOSED_BY_STANDARD_DISCOVERY,
+    UNKNOWN,
+}
+
 data class DeviceCameraProfile(
-    val schemaVersion: Int = 1,
+    val schemaVersion: Int = 2,
     val manufacturer: String,
     val model: String,
     val sdkInt: Int,
     val scannedAtEpochMillis: Long,
     val cameras: List<CameraDescriptor>,
     val logicalGroups: List<LogicalCameraGroup>,
+    val legacyCameraCount: Int? = null,
+    val legacyCameras: List<LegacyCameraDescriptor> = emptyList(),
+    val concurrentCameraIdSets: List<List<String>> = emptyList(),
+    val publicExposureAssessment: PublicCameraExposureAssessment = PublicCameraExposureAssessment.UNKNOWN,
 )
