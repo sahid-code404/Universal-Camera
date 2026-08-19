@@ -84,6 +84,7 @@ import com.omnicam.camera.camerax.HeifEncodingPath
 import com.omnicam.camera.camerax.PhotoAspectRatio
 import com.omnicam.camera.camerax.PhotoCaptureResult
 import com.omnicam.camera.camerax.PhotoOutputFormat
+import com.omnicam.camera.camerax.ProControls
 import com.omnicam.camera.capability.CameraCapabilityScanner
 import com.omnicam.camera.capability.CameraRouteAccess
 import com.omnicam.camera.capability.ValuableCameraResolver
@@ -93,6 +94,8 @@ import com.omnicam.core.model.LensFacing
 import com.omnicam.core.model.LensRole
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -132,6 +135,11 @@ fun UniversalCameraRoute(
     var latestPhoto by remember { mutableStateOf<Uri?>(null) }
     var settingsOpen by remember { mutableStateOf(false) }
     var lensManagerOpen by remember { mutableStateOf(false) }
+    var proOpen by remember { mutableStateOf(false) }
+    var proEnabled by remember { mutableStateOf(false) }
+    var manualIso by remember { mutableStateOf(100) }
+    var manualExposureNs by remember { mutableStateOf(16_666_667L) }
+    var manualFocusDiopters by remember { mutableFloatStateOf(0f) }
     var lifecycleResumed by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
     }
@@ -149,9 +157,7 @@ fun UniversalCameraRoute(
 
     val galleryLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
-    ) { result ->
-        result.data?.data?.let { latestPhoto = it }
-    }
+    ) { result -> result.data?.data?.let { latestPhoto = it } }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -197,6 +203,35 @@ fun UniversalCameraRoute(
 
     val selectedRoute = visibleRoutes.firstOrNull { it.camera.id == selectedId }
 
+    LaunchedEffect(selectedRoute?.camera?.id) {
+        val camera = selectedRoute?.camera
+        val isoRange = camera?.sensitivityRange
+        val shutterRange = camera?.exposureTimeRangeNs
+        manualIso = isoRange?.let { 100.coerceIn(it.first, it.last) } ?: 100
+        manualExposureNs = shutterRange?.let {
+            16_666_667L.coerceIn(it.first, it.last)
+        } ?: 16_666_667L
+        manualFocusDiopters = 0f
+        if (camera?.manualSensorSupported != true) proEnabled = false
+    }
+
+    LaunchedEffect(
+        proEnabled,
+        manualIso,
+        manualExposureNs,
+        manualFocusDiopters,
+        selectedRoute?.camera?.id,
+    ) {
+        controller.setProControls(
+            ProControls(
+                enabled = proEnabled && selectedRoute?.camera?.manualSensorSupported == true,
+                iso = manualIso,
+                exposureTimeNs = manualExposureNs,
+                focusDistanceDiopters = manualFocusDiopters,
+            ),
+        )
+    }
+
     LaunchedEffect(
         selectedRoute,
         aspect,
@@ -233,6 +268,14 @@ fun UniversalCameraRoute(
             zoom = 1f.coerceIn(minZoom, maxZoom)
             controller.setZoomRatio(zoom)
         }
+        controller.setProControls(
+            ProControls(
+                enabled = proEnabled && route.camera.manualSensorSupported,
+                iso = manualIso,
+                exposureTimeNs = manualExposureNs,
+                focusDistanceDiopters = manualFocusDiopters,
+            ),
+        )
     }
 
     LaunchedEffect(flash) { controller.setFlashMode(flash) }
@@ -272,6 +315,7 @@ fun UniversalCameraRoute(
                 minZoom = minZoom,
                 maxZoom = maxZoom,
                 exposure = exposure,
+                proEnabled = proEnabled,
                 bindResult = bindResult,
                 captureResult = captureResult,
                 capturing = capturing,
@@ -296,6 +340,7 @@ fun UniversalCameraRoute(
                     flash = nextFlashMode(flash, selectedRoute?.camera?.flashAvailable == true)
                 },
                 onAspect = { aspect = nextAspectRatio(aspect) },
+                onPro = { proOpen = true },
                 onSettings = { settingsOpen = true },
                 onSelectLens = { selectedId = it },
                 onFlip = {
@@ -316,8 +361,16 @@ fun UniversalCameraRoute(
                             androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress,
                         )
                         scope.launch {
-                            captureResult = controller.capturePhoto(displayRotationDegrees(textureView))
-                            (captureResult as? PhotoCaptureResult.Success)?.let { latestPhoto = it.uri }
+                            val immediate = controller.capturePhoto(
+                                displayRotationDegrees(textureView),
+                            ) { finalized ->
+                                captureResult = finalized
+                                (finalized as? PhotoCaptureResult.Success)?.let {
+                                    latestPhoto = it.uri
+                                }
+                            }
+                            captureResult = immediate
+                            (immediate as? PhotoCaptureResult.Success)?.let { latestPhoto = it.uri }
                             capturing = false
                         }
                     }
@@ -349,6 +402,9 @@ fun UniversalCameraRoute(
         SettingsSheet(
             photoFormat = preferences.photoFormat,
             photoQuality = preferences.photoQuality,
+            rawAvailable = selectedRoute?.let {
+                it.access == CameraRouteAccess.DIRECT_CAMERA_DEVICE && it.camera.rawSupported
+            } == true,
             onDismiss = { settingsOpen = false },
             onPhotoFormat = { format ->
                 scope.launch { preferencesStore.setPhotoFormat(format) }
@@ -364,6 +420,21 @@ fun UniversalCameraRoute(
                 settingsOpen = false
                 onOpenDiagnostics()
             },
+        )
+    }
+
+    if (proOpen) {
+        ProSheet(
+            route = selectedRoute,
+            enabled = proEnabled,
+            iso = manualIso,
+            exposureTimeNs = manualExposureNs,
+            focusDistanceDiopters = manualFocusDiopters,
+            onDismiss = { proOpen = false },
+            onEnabled = { proEnabled = it },
+            onIso = { manualIso = it },
+            onExposureTimeNs = { manualExposureNs = it },
+            onFocusDistanceDiopters = { manualFocusDiopters = it },
         )
     }
 
@@ -407,6 +478,7 @@ private fun CameraView(
     minZoom: Float,
     maxZoom: Float,
     exposure: Float,
+    proEnabled: Boolean,
     bindResult: CameraBindResult?,
     captureResult: PhotoCaptureResult?,
     capturing: Boolean,
@@ -418,6 +490,7 @@ private fun CameraView(
     onExposure: (Float) -> Unit,
     onFlash: () -> Unit,
     onAspect: () -> Unit,
+    onPro: () -> Unit,
     onSettings: () -> Unit,
     onSelectLens: (String) -> Unit,
     onFlip: () -> Unit,
@@ -451,9 +524,9 @@ private fun CameraView(
                         if (scale != 1f) onZoom(zoom * scale)
                     }
                 }
-                .pointerInput(route?.camera?.id) {
+                .pointerInput(route?.camera?.id, proEnabled) {
                     detectTapGestures { point ->
-                        onTapFocus(point, size.width.toFloat(), size.height.toFloat())
+                        if (!proEnabled) onTapFocus(point, size.width.toFloat(), size.height.toFloat())
                     }
                 },
         )
@@ -463,8 +536,8 @@ private fun CameraView(
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
                 .background(Color.Black.copy(alpha = 0.62f))
-                .padding(top = 38.dp, start = 8.dp, end = 8.dp, bottom = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
+                .padding(top = 38.dp, start = 4.dp, end = 4.dp, bottom = 8.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
             TopControl(
                 if (route?.camera?.flashAvailable == true) flashLabel(flash) else "Flash --",
@@ -472,6 +545,11 @@ private fun CameraView(
                 onFlash,
             )
             TopControl(aspect.label, true, onAspect)
+            TopControl(
+                if (proEnabled) "PRO" else "Auto",
+                route?.camera?.manualSensorSupported == true,
+                onPro,
+            )
             TopControl("Settings", true, onSettings)
         }
 
@@ -482,7 +560,7 @@ private fun CameraView(
             )
         }
 
-        focusPoint?.let { point ->
+        focusPoint?.takeIf { !proEnabled }?.let { point ->
             Surface(
                 modifier = Modifier
                     .offset {
@@ -498,7 +576,7 @@ private fun CameraView(
             ) {}
         }
 
-        if (exposureRange.first != exposureRange.last) {
+        if (!proEnabled && exposureRange.first != exposureRange.last) {
             Column(
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
@@ -547,10 +625,11 @@ private fun CameraView(
             Text(
                 buildString {
                     append(if (zoom > 1.02f) String.format(Locale.US, "%.1fx", zoom) else "PHOTO")
+                    if (proEnabled) append(" · PRO")
                     append(" · ")
                     append(aspect.label)
                     append(" · ")
-                    append(if (photoFormat == PhotoOutputFormat.HEIF) "HEIF" else "JPEG")
+                    append(photoFormat.name)
                 },
                 color = Color.White.copy(alpha = 0.82f),
                 style = MaterialTheme.typography.labelLarge,
@@ -618,12 +697,15 @@ private fun CameraView(
 @Composable
 private fun CaptureStatus(result: PhotoCaptureResult?) {
     val message = when (result) {
+        is PhotoCaptureResult.Processing -> result.message
         is PhotoCaptureResult.Failure -> result.message
         is PhotoCaptureResult.Success -> when {
-            result.usedFormatFallback -> "HEIF encoding unavailable; saved JPEG compatibility fallback."
+            result.usedFormatFallback ->
+                "${result.requestedFormat.name} unavailable on this route/session; saved ${result.actualFormat.name}."
+            result.actualFormat == PhotoOutputFormat.DNG -> "Saved RAW sensor frame as DNG."
             result.actualFormat == PhotoOutputFormat.HEIF &&
                 result.heifEncodingPath == HeifEncodingPath.SOFTWARE_HEVC ->
-                "Saved HEIF using YUV + HEVC software pipeline."
+                "Saved HEIF using YUV + HEVC background pipeline."
             result.actualFormat == PhotoOutputFormat.HEIF &&
                 result.heifEncodingPath == HeifEncodingPath.NATIVE_CAMERA ->
                 "Saved native Camera2 HEIF."
@@ -732,6 +814,7 @@ private fun StatusPill(text: String, modifier: Modifier = Modifier) {
 private fun SettingsSheet(
     photoFormat: PhotoOutputFormat,
     photoQuality: Int,
+    rawAvailable: Boolean,
     onDismiss: () -> Unit,
     onPhotoFormat: (PhotoOutputFormat) -> Unit,
     onPhotoQuality: (Int) -> Unit,
@@ -762,9 +845,19 @@ private fun SettingsSheet(
                     text = "JPEG",
                     onClick = { onPhotoFormat(PhotoOutputFormat.JPEG) },
                 )
+                FormatButton(
+                    selected = photoFormat == PhotoOutputFormat.DNG,
+                    text = "RAW DNG",
+                    enabled = rawAvailable,
+                    onClick = { onPhotoFormat(PhotoOutputFormat.DNG) },
+                )
             }
             Text(
-                "HEIF first uses native Camera2 HEIC. If the lens/HAL does not expose HEIC, OmniCam captures YUV and encodes a real HEIF through the device HEVC codec. JPEG is now the final fallback only.",
+                if (rawAvailable) {
+                    "RAW DNG is available on this direct Camera2 lens. HEIF finalization now runs in the background, so the shutter can recover before HEVC encoding finishes."
+                } else {
+                    "This lens does not expose an independently usable RAW_SENSOR route. HEIF still uses native HEIC, then YUV + HEVC, then JPEG as the final fallback."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -776,9 +869,10 @@ private fun SettingsSheet(
                 onValueChange = { onPhotoQuality(it.roundToInt()) },
                 valueRange = 70f..100f,
                 steps = 29,
+                enabled = photoFormat != PhotoOutputFormat.DNG,
             )
             Text(
-                "100 requests the best available HEIF/JPEG encode quality. HEIF is efficient but is still normally lossy; RAW/DNG is the later path for sensor-level data.",
+                "Quality applies to HEIF/JPEG. DNG stores the RAW sensor frame rather than an HEVC/JPEG encode.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -791,7 +885,7 @@ private fun SettingsSheet(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                "Tap the aspect-ratio control in the camera header to cycle through them. Software HEIF can center-crop YUV without stretching when a lens does not advertise that exact output size.",
+                "DNG always contains the sensor's native RAW dimensions; display aspect selection is for the normal processed-photo viewfinder/capture path.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -809,11 +903,108 @@ private fun SettingsSheet(
 }
 
 @Composable
-private fun FormatButton(selected: Boolean, text: String, onClick: () -> Unit) {
+private fun FormatButton(
+    selected: Boolean,
+    text: String,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
     if (selected) {
-        Button(onClick = onClick) { Text(text) }
+        Button(onClick = onClick, enabled = enabled) { Text(text) }
     } else {
-        TextButton(onClick = onClick) { Text(text) }
+        TextButton(onClick = onClick, enabled = enabled) { Text(text) }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ProSheet(
+    route: ValuableCameraRoute?,
+    enabled: Boolean,
+    iso: Int,
+    exposureTimeNs: Long,
+    focusDistanceDiopters: Float,
+    onDismiss: () -> Unit,
+    onEnabled: (Boolean) -> Unit,
+    onIso: (Int) -> Unit,
+    onExposureTimeNs: (Long) -> Unit,
+    onFocusDistanceDiopters: (Float) -> Unit,
+) {
+    val camera = route?.camera
+    val supported = camera?.manualSensorSupported == true &&
+        camera.sensitivityRange != null && camera.exposureTimeRangeNs != null
+    val isoRange = camera?.sensitivityRange ?: 100..100
+    val exposureRange = camera?.exposureTimeRangeNs ?: 16_666_667L..16_666_667L
+    val minFocus = camera?.minimumFocusDistanceDiopters ?: 0f
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().padding(20.dp)) {
+            Text("Pro controls", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.width(240.dp)) {
+                    Text("Manual sensor", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (supported) "Manual ISO, shutter and focus use Camera2 sensor controls." else "Not exposed by this lens.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = enabled && supported,
+                    enabled = supported,
+                    onCheckedChange = onEnabled,
+                )
+            }
+
+            if (supported && enabled) {
+                Spacer(Modifier.height(14.dp))
+                Text("ISO $iso", fontWeight = FontWeight.SemiBold)
+                Slider(
+                    value = iso.toFloat().coerceIn(isoRange.first.toFloat(), isoRange.last.toFloat()),
+                    onValueChange = { onIso(it.roundToInt()) },
+                    valueRange = isoRange.first.toFloat()..isoRange.last.toFloat(),
+                )
+
+                Spacer(Modifier.height(8.dp))
+                Text("Shutter ${formatShutter(exposureTimeNs)}", fontWeight = FontWeight.SemiBold)
+                Slider(
+                    value = longToLogSlider(exposureTimeNs, exposureRange),
+                    onValueChange = { onExposureTimeNs(logSliderToLong(it, exposureRange)) },
+                    valueRange = 0f..1f,
+                )
+
+                if (minFocus > 0f) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Focus ${formatFocusDistance(focusDistanceDiopters)}",
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Slider(
+                        value = focusDistanceDiopters.coerceIn(0f, minFocus),
+                        onValueChange = onFocusDistanceDiopters,
+                        valueRange = 0f..minFocus,
+                    )
+                } else {
+                    Text(
+                        "This lens is fixed-focus or does not expose manual focus distance.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Text(
+                    "In manual sensor mode AE and AF are disabled. Flash Auto/On are not used; Torch can remain active where supported.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            Spacer(Modifier.height(18.dp))
+            Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("Done") }
+            Spacer(Modifier.height(16.dp))
+        }
     }
 }
 
@@ -959,6 +1150,43 @@ private fun flashLabel(mode: CameraFlashMode): String = when (mode) {
     CameraFlashMode.AUTO -> "Flash Auto"
     CameraFlashMode.ON -> "Flash On"
     CameraFlashMode.TORCH -> "Torch"
+}
+
+private fun formatShutter(exposureTimeNs: Long): String {
+    val seconds = exposureTimeNs / 1_000_000_000.0
+    return if (seconds >= 1.0) {
+        String.format(Locale.US, "%.1fs", seconds)
+    } else {
+        val denominator = (1.0 / seconds.coerceAtLeast(0.000001)).roundToInt().coerceAtLeast(1)
+        "1/${denominator}s"
+    }
+}
+
+private fun longToLogSlider(value: Long, range: LongRange): Float {
+    if (range.first <= 0L || range.last <= range.first) return 0f
+    val minLog = ln(range.first.toDouble())
+    val maxLog = ln(range.last.toDouble())
+    val valueLog = ln(value.coerceIn(range.first, range.last).toDouble())
+    return ((valueLog - minLog) / (maxLog - minLog)).toFloat().coerceIn(0f, 1f)
+}
+
+private fun logSliderToLong(value: Float, range: LongRange): Long {
+    if (range.first <= 0L || range.last <= range.first) return range.first
+    val minLog = ln(range.first.toDouble())
+    val maxLog = ln(range.last.toDouble())
+    return exp(minLog + value.coerceIn(0f, 1f) * (maxLog - minLog))
+        .toLong()
+        .coerceIn(range.first, range.last)
+}
+
+private fun formatFocusDistance(diopters: Float): String {
+    if (diopters <= 0.001f) return "∞"
+    val meters = 1f / diopters
+    return if (meters >= 1f) {
+        String.format(Locale.US, "%.2f m", meters)
+    } else {
+        String.format(Locale.US, "%.0f cm", meters * 100f)
+    }
 }
 
 private fun chooseDefaultRoute(routes: List<ValuableCameraRoute>): ValuableCameraRoute? =
