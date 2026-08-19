@@ -31,14 +31,10 @@ import kotlinx.coroutines.withTimeout
 /**
  * Phase C1 computational RAW engine.
  *
- * The engine is intentionally independent of JPEG/HEIF capture. It captures RAW_SENSOR frames,
- * synchronizes every image with its TotalCaptureResult by SENSOR_TIMESTAMP, stages the large Bayer
- * planes in file-backed buffers instead of retaining an entire burst on the managed heap, estimates
- * same-CFA integer translation, rejects locally inconsistent/moving samples and fuses the remaining
- * linear sensor values into a 16-bit Bayer buffer at the reference exposure.
- *
- * C1 output is suitable for DngCreator.writeByteBuffer(). C2 will replace this conservative integer
- * registration with sub-pixel/local alignment and add the custom demosaic/color/HDR output engine.
+ * RAW images are paired with TotalCaptureResult by SENSOR_TIMESTAMP, packed immediately into
+ * file-backed RAW16 scratch buffers, aligned on the Bayer grid, motion/outlier rejected, then
+ * fused into one 16-bit Bayer buffer at the reference exposure. C1 deliberately stays in the RAW
+ * domain; custom demosaic/color/tone-map and multi-frame super-resolution are later stages.
  */
 internal class ComputationalRawEngine(
     private val cameraHandler: Handler,
@@ -119,7 +115,6 @@ internal class ComputationalRawEngine(
     ): MergeResult {
         require(reader.imageFormat == ImageFormat.RAW_SENSOR)
         scratchDir.mkdirs()
-
         val frames = captureBurst(
             device = device,
             session = session,
@@ -152,42 +147,44 @@ internal class ComputationalRawEngine(
         applySensorPixelMode: (CaptureRequest.Builder) -> Unit,
     ): List<CapturedRawFrame> = withTimeout(BURST_TIMEOUT_MS) {
         suspendCancellableCoroutine { continuation ->
+            val lock = Any()
             val payloadsByTimestamp = mutableMapOf<Long, RawPayload>()
             val resultsByTimestamp = mutableMapOf<Long, TotalCaptureResult>()
             val completed = mutableListOf<CapturedRawFrame>()
             val targetCount = plan.frameCount
+            val blackLevels = staticBlackLevels(characteristics)
+            val whiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 65535
             var terminal = false
 
-            fun cleanup() {
+            fun cleanupLocked(deleteCompleted: Boolean) {
                 reader.setOnImageAvailableListener(null, null)
                 payloadsByTimestamp.values.forEach { runCatching { it.file.delete() } }
                 payloadsByTimestamp.clear()
                 resultsByTimestamp.clear()
+                if (deleteCompleted) {
+                    completed.forEach { runCatching { it.file.delete() } }
+                    completed.clear()
+                }
             }
 
             fun fail(error: Throwable) {
-                if (terminal) return
-                terminal = true
-                cleanup()
-                completed.forEach { runCatching { it.file.delete() } }
-                if (continuation.isActive) continuation.resumeWithException(error)
+                var shouldResume = false
+                synchronized(lock) {
+                    if (!terminal) {
+                        terminal = true
+                        cleanupLocked(deleteCompleted = true)
+                        shouldResume = continuation.isActive
+                    }
+                }
+                if (shouldResume) continuation.resumeWithException(error)
             }
 
-            fun completeIfReady() {
-                if (terminal || completed.size < targetCount) return
-                terminal = true
-                cleanup()
-                if (continuation.isActive) continuation.resume(completed.take(targetCount))
-            }
-
-            fun pairTimestamp(timestamp: Long) {
-                if (terminal) return
-                val payload = payloadsByTimestamp[timestamp] ?: return
-                val result = resultsByTimestamp[timestamp] ?: return
+            fun pairLocked(timestamp: Long): List<CapturedRawFrame>? {
+                if (terminal) return null
+                val payload = payloadsByTimestamp[timestamp] ?: return null
+                val result = resultsByTimestamp[timestamp] ?: return null
                 payloadsByTimestamp.remove(timestamp)
                 resultsByTimestamp.remove(timestamp)
-                val blackLevels = staticBlackLevels(characteristics)
-                val whiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 65535
                 completed += CapturedRawFrame(
                     width = payload.width,
                     height = payload.height,
@@ -195,25 +192,41 @@ internal class ComputationalRawEngine(
                     result = result,
                     exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: baseExposureTimeNs,
                     iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: baseIso,
-                    blackLevels = blackLevels,
+                    blackLevels = blackLevels.copyOf(),
                     whiteLevel = whiteLevel,
                 )
-                completeIfReady()
+                if (completed.size < targetCount) return null
+                terminal = true
+                cleanupLocked(deleteCompleted = false)
+                return completed.take(targetCount)
+            }
+
+            fun deliverIfComplete(frames: List<CapturedRawFrame>?) {
+                if (frames != null && continuation.isActive) continuation.resume(frames)
             }
 
             reader.setOnImageAvailableListener({ source ->
                 val image = runCatching { source.acquireNextImage() }.getOrNull()
                     ?: return@setOnImageAvailableListener
-                if (!continuation.isActive || terminal) {
+                if (!continuation.isActive) {
                     image.close()
                     return@setOnImageAvailableListener
                 }
-                val timestamp = image.timestamp
                 val payload = runCatching { stageRawImage(image) }
                 image.close()
-                payload.onSuccess {
-                    payloadsByTimestamp[timestamp] = it
-                    pairTimestamp(timestamp)
+                payload.onSuccess { staged ->
+                    var completion: List<CapturedRawFrame>? = null
+                    var deleteStaged = false
+                    synchronized(lock) {
+                        if (terminal || !continuation.isActive) {
+                            deleteStaged = true
+                        } else {
+                            payloadsByTimestamp[staged.timestampNs] = staged
+                            completion = pairLocked(staged.timestampNs)
+                        }
+                    }
+                    if (deleteStaged) staged.file.delete()
+                    deliverIfComplete(completion)
                 }.onFailure(::fail)
             }, imageHandler)
 
@@ -222,11 +235,7 @@ internal class ComputationalRawEngine(
             val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 ?: Range(50, 6400)
             val iso = baseIso.coerceIn(isoRange.lower, isoRange.upper)
-            val offsets = if (plan.exposureOffsetsEv.isNotEmpty()) {
-                plan.exposureOffsetsEv
-            } else {
-                defaultOffsets(plan.frameCount)
-            }
+            val offsets = plan.exposureOffsetsEv.ifEmpty { defaultOffsets(plan.frameCount) }
             val awbLockSupported = characteristics.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true
 
             val requests = offsets.map { ev ->
@@ -260,14 +269,20 @@ internal class ComputationalRawEngine(
                     request: CaptureRequest,
                     result: TotalCaptureResult,
                 ) {
-                    if (!continuation.isActive || terminal) return
+                    if (!continuation.isActive) return
                     val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
                     if (timestamp == null) {
                         fail(IllegalStateException("RAW burst result did not contain SENSOR_TIMESTAMP"))
                         return
                     }
-                    resultsByTimestamp[timestamp] = result
-                    pairTimestamp(timestamp)
+                    var completion: List<CapturedRawFrame>? = null
+                    synchronized(lock) {
+                        if (!terminal) {
+                            resultsByTimestamp[timestamp] = result
+                            completion = pairLocked(timestamp)
+                        }
+                    }
+                    deliverIfComplete(completion)
                 }
 
                 override fun onCaptureFailed(
@@ -281,10 +296,14 @@ internal class ComputationalRawEngine(
 
             runCatching { session.captureBurst(requests, callback, cameraHandler) }
                 .onFailure(::fail)
+
             continuation.invokeOnCancellation {
-                terminal = true
-                cleanup()
-                completed.forEach { runCatching { it.file.delete() } }
+                synchronized(lock) {
+                    if (!terminal) {
+                        terminal = true
+                        cleanupLocked(deleteCompleted = true)
+                    }
+                }
             }
         }
     }
@@ -294,6 +313,7 @@ internal class ComputationalRawEngine(
         val plane = image.planes.single()
         val width = image.width
         val height = image.height
+        val timestamp = image.timestamp
         val file = File.createTempFile("omnicam_craw_", ".raw16", scratchDir)
         try {
             FileOutputStream(file).channel.use { channel ->
@@ -313,20 +333,20 @@ internal class ComputationalRawEngine(
                         val row = source.duplicate()
                         row.position(rowStart)
                         row.limit(rowStart + width * BYTES_PER_RAW_PIXEL)
-                        channel.write(row.slice())
+                        val slice = row.slice()
+                        while (slice.hasRemaining()) channel.write(slice)
                     } else {
                         packedRow.clear()
                         for (x in 0 until width) {
                             val offset = rowStart + x * pixelStride
-                            val value = if (offset + 1 < limit) source.getShort(offset) else 0
-                            packedRow.putShort(value)
+                            packedRow.putShort(if (offset + 1 < limit) source.getShort(offset) else 0)
                         }
                         packedRow.flip()
                         while (packedRow.hasRemaining()) channel.write(packedRow)
                     }
                 }
             }
-            return RawPayload(image.timestamp, width, height, file)
+            return RawPayload(timestamp, width, height, file)
         } catch (error: Throwable) {
             file.delete()
             throw error
@@ -403,7 +423,6 @@ internal class ComputationalRawEngine(
                         rejected++
                         continue
                     }
-
                     val exposureWeight = when {
                         linear < 0.01f -> 0.15
                         linear > 0.97f -> 0.08
@@ -441,11 +460,7 @@ internal class ComputationalRawEngine(
         )
     }
 
-    /**
-     * C1 uses a conservative global translation search on a sparse same-CFA grid. Search offsets
-     * are even pixels only so Bayer color phase is preserved. C2 will replace this with pyramidal
-     * local/sub-pixel registration while maintaining CFA consistency.
-     */
+    /** C1 keeps even-pixel shifts only so the 2×2 Bayer CFA phase cannot be swapped. */
     private fun estimateTranslation(
         reference: CapturedRawFrame,
         referenceAccessor: RawAccessor,
@@ -456,7 +471,6 @@ internal class ComputationalRawEngine(
         var secondScore = Double.POSITIVE_INFINITY
         var bestDx = 0
         var bestDy = 0
-
         for (dy in -ALIGNMENT_SEARCH_RADIUS..ALIGNMENT_SEARCH_RADIUS step CFA_PERIOD) {
             for (dx in -ALIGNMENT_SEARCH_RADIUS..ALIGNMENT_SEARCH_RADIUS step CFA_PERIOD) {
                 var error = 0.0
@@ -496,9 +510,7 @@ internal class ComputationalRawEngine(
         val separation = if (secondScore.isFinite() && secondScore > 0.0) {
             ((secondScore - bestScore) / secondScore).coerceIn(0.0, 1.0)
         } else 0.0
-        // Even a flat scene needs a small floor so perfectly stable frames can still contribute.
-        val confidence = max(MIN_ALIGNMENT_CONFIDENCE, separation.toFloat())
-        return Alignment(bestDx, bestDy, confidence)
+        return Alignment(bestDx, bestDy, max(MIN_ALIGNMENT_CONFIDENCE, separation.toFloat()))
     }
 
     private fun staticBlackLevels(characteristics: CameraCharacteristics): IntArray {
