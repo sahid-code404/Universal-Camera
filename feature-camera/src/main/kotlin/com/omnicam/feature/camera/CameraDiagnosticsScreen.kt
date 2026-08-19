@@ -46,6 +46,7 @@ import java.util.Locale
 @Composable
 fun CameraDiagnosticsRoute(
     viewModel: CameraDiagnosticsViewModel,
+    onOpenLensTest: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -86,6 +87,7 @@ fun CameraDiagnosticsRoute(
             DiagnosticsContent(
                 state = state,
                 onRetry = { viewModel.scan(force = true) },
+                onOpenLensTest = onOpenLensTest,
                 onExport = { profile ->
                     pendingExport = profile.toSanitizedJson()
                     exportLauncher.launch("omnicam-snapcam-aux-identity-report.json")
@@ -119,6 +121,7 @@ private fun PermissionContent(onRequestPermission: () -> Unit) {
 private fun DiagnosticsContent(
     state: CameraDiagnosticsUiState,
     onRetry: () -> Unit,
+    onOpenLensTest: () -> Unit,
     onExport: (DeviceCameraProfile) -> Unit,
 ) {
     when (state) {
@@ -175,15 +178,17 @@ private fun DiagnosticsContent(
                     )
                     Spacer(Modifier.height(14.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Button(onClick = { onExport(profile) }) { Text("Export JSON") }
-                        OutlinedButton(onClick = onRetry) { Text("Rescan") }
+                        Button(onClick = onOpenLensTest) { Text("Open live lens test") }
+                        OutlinedButton(onClick = { onExport(profile) }) { Text("Export JSON") }
                     }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = onRetry) { Text("Rescan") }
                 }
                 item { PublicExposureProbeCard(profile) }
                 items(profile.cameras, key = { it.id }) { camera -> CameraCard(camera) }
                 item {
                     Text(
-                        "This is an isolated diagnostic identity experiment. Do not use the package identity as OmniCam's production package. Physical or guessed IDs are not considered capture-capable until a later opening/session test proves it.",
+                        "This is an isolated diagnostic identity experiment. Do not use the package identity as OmniCam's production package. Live preview/capture probes validate which exposed IDs CameraX can actually bind.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
