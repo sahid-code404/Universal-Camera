@@ -38,7 +38,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
-/** User-facing C1 presets. They differ only in RAW acquisition policy; no fake super-resolution. */
+/** User-facing computational RAW presets. */
 enum class ComputationalRawPreset(
     val label: String,
     val frameCount: Int,
@@ -83,7 +83,10 @@ sealed interface ComputationalRawBindResult {
 
 sealed interface ComputationalRawCaptureResult {
     data class Success(
+        /** Finished C2 computational HEIF. */
         val uri: Uri,
+        /** Optional expert/archive C1 merged Bayer DNG from the same burst. */
+        val dngUri: Uri,
         val width: Int,
         val height: Int,
         val frameCount: Int,
@@ -92,19 +95,22 @@ sealed interface ComputationalRawCaptureResult {
         val alignments: List<ComputationalRawEngine.Alignment>,
         val preset: ComputationalRawPreset,
         val elapsedMillis: Long,
+        val c2ProcessingMillis: Long,
         val maximumResolutionMode: Boolean,
+        val colorTransformFromCamera: Boolean,
+        val whiteBalanceFromCamera: Boolean,
     ) : ComputationalRawCaptureResult
 
     data class Failure(val message: String) : ComputationalRawCaptureResult
 }
 
 /**
- * Isolated hardware-validation controller for the Phase C1 computational RAW engine.
+ * Computational RAW controller.
  *
- * Normal OmniCam JPEG/HEIF capture is intentionally not routed through this class yet. The lab
- * opens a direct RAW-capable Camera2 route, maintains an AE/AF preview, freezes the latest exposure,
- * focus and AWB state for a burst, performs C1 RAW fusion off the UI thread, then writes the merged
- * Bayer buffer as a DNG using the reference capture metadata.
+ * C1 acquires/fuses RAW_SENSOR frames into one 16-bit Bayer buffer. C2 immediately takes that
+ * fused Bayer buffer through OmniCam's own CPU demosaic, Camera2 WB/color transform and tone-map
+ * pipeline to create a full-resolution HEIF. The merged Bayer DNG is kept as an expert/archive
+ * sidecar so validation never hides the underlying computational RAW result.
  */
 class ComputationalRawController(context: Context) {
     private val appContext = context.applicationContext
@@ -118,6 +124,7 @@ class ComputationalRawController(context: Context) {
         imageHandler = imageHandler,
         scratchDir = java.io.File(appContext.cacheDir, "computational-raw"),
     )
+    private val processor = ComputationalRawProcessor(appContext)
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -133,7 +140,7 @@ class ComputationalRawController(context: Context) {
         sessionKey: String = "",
     ): ComputationalRawViewfinderSpec {
         require(route.access == CameraRouteAccess.DIRECT_CAMERA_DEVICE) {
-            "C1 currently requires an independently openable RAW camera route"
+            "Computational RAW currently requires an independently openable RAW camera route"
         }
         val chars = cameraManager.getCameraCharacteristics(route.camera.id)
         val previewSize = choosePreviewSize(chars)
@@ -149,7 +156,7 @@ class ComputationalRawController(context: Context) {
             width = previewSize.width,
             height = previewSize.height,
             requestId = buildString {
-                append("c1:")
+                append("c2:")
                 append(route.camera.id)
                 append(':')
                 append(previewSize.width)
@@ -318,11 +325,20 @@ class ComputationalRawController(context: Context) {
                 merged
             }.let { merged ->
                 onProgress(
-                    "RAW fusion complete · writing ${merged.width}×${merged.height} computational DNG",
+                    "RAW fusion complete · saving merged DNG",
                 )
-                val uri = withContext(Dispatchers.IO) { saveMergedDng(merged, preset) }
+                val dngUri = withContext(Dispatchers.IO) { saveMergedDng(merged, preset) }
+
+                onProgress(
+                    "C2 software ISP · demosaic → WB/color → HDR tone map → HEIF",
+                )
+                val processed = withContext(Dispatchers.Default) {
+                    processor.processAndSave(merged, preset)
+                }
+
                 ComputationalRawCaptureResult.Success(
-                    uri = uri,
+                    uri = processed.uri,
+                    dngUri = dngUri,
                     width = merged.width,
                     height = merged.height,
                     frameCount = merged.frameCount,
@@ -331,7 +347,10 @@ class ComputationalRawController(context: Context) {
                     alignments = merged.alignments,
                     preset = preset,
                     elapsedMillis = android.os.SystemClock.elapsedRealtime() - started,
+                    c2ProcessingMillis = processed.processingMillis,
                     maximumResolutionMode = candidate.maximumResolutionMode,
+                    colorTransformFromCamera = processed.colorTransformFromCamera,
+                    whiteBalanceFromCamera = processed.whiteBalanceFromCamera,
                 )
             }
         }.getOrElse { error ->
@@ -415,7 +434,7 @@ class ComputationalRawController(context: Context) {
                     merged.referenceResult,
                 ).use { creator ->
                     creator.setDescription(
-                        "OmniCam Phase C1 ${preset.name}: ${merged.frameCount}-frame aligned RAW fusion",
+                        "OmniCam C1 ${preset.name}: ${merged.frameCount}-frame aligned RAW fusion; C2 HEIF companion generated by OmniCam software ISP",
                     )
                     creator.writeByteBuffer(
                         output,
