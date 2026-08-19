@@ -5,9 +5,11 @@ import android.util.Base64
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.omnicam.camera.camerax.PhotoOutputFormat
 import com.omnicam.camera.capability.ValuableCameraRoute
 import com.omnicam.core.model.LensFacing
 import java.io.IOException
@@ -21,6 +23,8 @@ data class LensPreferences(
     val rearOrder: List<String> = emptyList(),
     val frontOrder: List<String> = emptyList(),
     val disabledCameraIds: Set<String> = emptySet(),
+    val photoFormat: PhotoOutputFormat = PhotoOutputFormat.HEIF,
+    val photoQuality: Int = 100,
 ) {
     fun isEnabled(cameraId: String): Boolean = cameraId !in disabledCameraIds
 
@@ -46,6 +50,10 @@ interface LensPreferencesStore {
     suspend fun setEnabled(cameraId: String, enabled: Boolean)
 
     suspend fun setOrder(facing: LensFacing, cameraIds: List<String>)
+
+    suspend fun setPhotoFormat(format: PhotoOutputFormat)
+
+    suspend fun setPhotoQuality(quality: Int)
 
     suspend fun reset()
 }
@@ -78,11 +86,21 @@ class DataStoreLensPreferencesStore(
         dataStore.edit { mutable -> mutable[key] = encodeOrder(cameraIds.distinct()) }
     }
 
+    override suspend fun setPhotoFormat(format: PhotoOutputFormat) {
+        dataStore.edit { mutable -> mutable[Keys.photoFormat] = format.name }
+    }
+
+    override suspend fun setPhotoQuality(quality: Int) {
+        dataStore.edit { mutable -> mutable[Keys.photoQuality] = quality.coerceIn(1, 100) }
+    }
+
     override suspend fun reset() {
         dataStore.edit { mutable ->
             mutable.remove(Keys.rearOrder)
             mutable.remove(Keys.frontOrder)
             mutable.remove(Keys.disabledIds)
+            mutable.remove(Keys.photoFormat)
+            mutable.remove(Keys.photoQuality)
         }
     }
 
@@ -90,12 +108,18 @@ class DataStoreLensPreferencesStore(
         rearOrder = decodeOrder(preferences[Keys.rearOrder]),
         frontOrder = decodeOrder(preferences[Keys.frontOrder]),
         disabledCameraIds = preferences[Keys.disabledIds].orEmpty(),
+        photoFormat = preferences[Keys.photoFormat]
+            ?.let { stored -> runCatching { PhotoOutputFormat.valueOf(stored) }.getOrNull() }
+            ?: PhotoOutputFormat.HEIF,
+        photoQuality = (preferences[Keys.photoQuality] ?: 100).coerceIn(1, 100),
     )
 
     private object Keys {
         val rearOrder = stringPreferencesKey("rear_order")
         val frontOrder = stringPreferencesKey("front_order")
         val disabledIds = stringSetPreferencesKey("disabled_camera_ids")
+        val photoFormat = stringPreferencesKey("photo_format")
+        val photoQuality = intPreferencesKey("photo_quality")
     }
 }
 
