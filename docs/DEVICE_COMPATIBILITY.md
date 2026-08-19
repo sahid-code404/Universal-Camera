@@ -1,19 +1,23 @@
 # Device Compatibility
 
-Physical-device validation has started. Results below describe what the tested ROM exposes to a normal third-party application through public Android camera APIs; they are not a list of every physical sensor installed in the phone.
+Physical-device validation has started. Keep raw Camera2 routes, resolved user lenses, and successful session routes separate.
 
-| Device | Android | Public rear cameras/lenses | Public front cameras/lenses | Logical groups | RAW | Manual | Known issues | Report/commit |
-|---|---:|---|---|---:|---|---|---|---|
-| Xiaomi POCO M2 Pro | API 36 (ROM unspecified) | Camera2 ID `0`: WIDE, ~25.6 mm eq | Camera2 ID `1`: FRONT, ~28.1 mm eq | 0 | rear + front | rear + front | Initial Camera2 scan exposes only main rear + front. No physical/logical aux IDs reported. Camera1/concurrent public-API cross-check added after this report and still needs a second device scan. | User Phase 1 report, 2026-08-19; aux-probe follow-up on `phase-0-1-foundation` |
+| Device | Android | Client identity | Raw Camera2 graph | Resolved/useful result | Session result | Notes |
+|---|---:|---|---|---|---|---|
+| Xiaomi POCO M2 Pro | API 36 | `com.omnicam.app` | 2 IDs: rear `0`, front `1`; 0 logical groups | rear main + front only | discovery only | Normal app identity is filtered by the tested ROM/HAL. |
+| Xiaomi POCO M2 Pro | API 36 | experimental `org.codeaurora.snapcam` | 8 total IDs; 6 raw rear routes; logical `61` has physical `0`,`20` | 4 useful rear routes: `21`, `22`, `20`, `0`; duplicate/aggregate routes hidden | `21`,`22`,`20`,`0` direct preview work; `100`,`61` fail as independent direct devices | Confirms package-sensitive auxiliary exposure on this ROM. `61` is infrastructure/logical, not another physical lens. `100` is treated as a vendor alias/alternate route. |
 
-## Validation rules
+## Resolver rules
 
-- `CameraManager.cameraIdList` entries are recorded as directly listed public camera IDs.
-- Physical IDs disclosed by a logical camera are recorded separately.
-- A disclosed physical ID is **not** automatically marked independently openable.
-- Do not add an OEM-hidden/system camera as supported merely because the stock camera app can use it.
-- Do not infer lens roles from numeric camera IDs.
-- Compare the diagnostic result with the stock camera only to identify potential missing public lenses; stock-app access is not evidence that a third-party app can access the same sensor.
-- For devices where Camera2 exposes only the primary rear/front cameras, also record the legacy Camera1 device count before concluding that no alternate public API exposes an auxiliary camera.
+- Do not show every raw Camera2 ID as a physical camera.
+- Logical aggregate IDs are hidden from the normal lens bar.
+- Strong optical-metadata duplicates are collapsed as vendor aliases.
+- Distinct directly listed photographic devices are useful candidates.
+- Physical members disclosed behind a logical camera are useful candidates and use physical-via-logical routing rather than being opened blindly.
+- Session success remains the final authority; enumeration is not proof of usability.
+- Never infer camera role from a fixed numeric ID table.
+- User enable/disable/order is persisted separately from hardware capability resolution.
 
-See `PHASE1_DEVICE_TEST.md` for the test procedure.
+## Coverage status
+
+The useful-camera resolver is designed generically, but Snapdragon-wide compatibility is **not yet validated**. More Qualcomm devices from Xiaomi, OnePlus, Motorola, Samsung, Nothing, and other OEM/ROM combinations are needed before making broad compatibility claims.
