@@ -8,7 +8,6 @@ import androidx.activity.viewModels
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
-import com.omnicam.feature.camera.CameraDiagnosticsRoute
 import com.omnicam.feature.camera.CameraDiagnosticsViewModel
 
 class MainActivity : ComponentActivity() {
@@ -21,7 +20,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             OmniCamTheme {
-                CameraDiagnosticsRoute(diagnosticsViewModel)
+                OmniCamApp(diagnosticsViewModel = diagnosticsViewModel)
             }
         }
     }

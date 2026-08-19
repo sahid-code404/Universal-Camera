@@ -39,6 +39,19 @@ class LensClassifierTest {
     }
 
     @Test
+    fun `multi-focal logical camera prefers normal wide representative`() {
+        val result = LensClassifier.classify(
+            LensClassifier.Input(
+                facing = LensFacing.BACK,
+                equivalentFocalLengthsMm = listOf(13f, 26f, 120f),
+                depthOnly = false,
+                monochrome = false,
+            ),
+        )
+        assertEquals(LensRole.WIDE, result.role)
+    }
+
+    @Test
     fun `missing optical metadata remains unknown instead of being guessed`() {
         val result = LensClassifier.classify(
             LensClassifier.Input(LensFacing.BACK, emptyList(), depthOnly = false, monochrome = false),
