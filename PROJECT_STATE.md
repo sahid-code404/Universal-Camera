@@ -4,7 +4,7 @@
 
 Phase 0 + Phase 1 implementation is **code-complete** on `phase-0-1-foundation`.
 
-Physical-device validation has now uncovered and reproduced a vendor-specific auxiliary-camera exposure behavior on Xiaomi POCO M2 Pro. A separate experiment branch is validating actual preview/capture usability of those newly exposed IDs before Phase 2/3 architecture is finalized.
+Physical-device validation has reproduced a vendor-specific auxiliary-camera exposure behavior on Xiaomi POCO M2 Pro. A separate experiment branch now has a CI-green CameraX live-preview + in-memory capture test for the newly exposed IDs. Real-device session validation is the remaining gate before the production Phase 2/3 routing architecture is finalized.
 
 ## Completed
 
@@ -48,14 +48,27 @@ An isolated Snapcam-compatible client identity (`org.codeaurora.snapcam`) on the
 
 This confirms that caller/client identity materially changes camera visibility on this tested ROM. It does **not** imply the same behavior across Xiaomi, Qualcomm, or Android devices generally.
 
+### Live auxiliary validation build
+
+The isolated experiment now includes:
+
+- CameraX `PreviewView` live preview.
+- direct Camera2-ID selection through CameraX Camera2 interop.
+- buttons for every enumerated rear Camera2 ID.
+- requested-vs-actual camera ID reporting.
+- in-memory `ImageCapture` probe that closes the frame without saving media.
+- per-ID bind/capture failure reporting.
+
+Hosted CI for the live-lens build passes unit tests, Android lint, APK assembly, and artifact upload.
+
 ## In Progress
 
-- `experiment-snapcam-aux-identity`: CameraX live preview and in-memory ImageCapture validation for every exposed rear ID.
+- Run the live-lens APK on POCO M2 Pro and validate preview + capture for IDs `21`, `22`, `20`, `0`, `100`, and `61`.
 - Determine which enumerated POCO IDs are truly session/capture-capable and what optical role each usable ID represents.
 
 ## Known Issues / Intentional Limits
 
-- An enumerated ID is not considered usable until an actual preview/session/capture succeeds.
+- An enumerated ID is not considered usable until an actual preview/session/capture succeeds on hardware.
 - Camera `22` is not yet labeled as macro; metadata alone is insufficient.
 - The Snapcam-compatible application ID is an isolated compatibility experiment and is **not** accepted as OmniCam's production identity.
 - OEM-hidden/system cameras remain inaccessible when the vendor stack does not expose them to the active caller identity.
@@ -83,7 +96,7 @@ See `docs/DEVICE_COMPATIBILITY.md`.
 
 The base Phase 0/1 hosted pipeline has passed Gradle wrapper validation, unit tests, Android lint, debug APK assembly, and artifact publication.
 
-The Snapcam identity enumeration experiment also passed hosted CI. The newer live lens/session experiment is being iterated until its own CI is green.
+The isolated Snapcam identity enumeration experiment is green, and the CameraX live-lens/session experiment is also green: unit tests, lint, APK assembly, and artifact publication all pass.
 
 ## Next Phase
 
