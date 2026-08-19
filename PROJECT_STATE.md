@@ -70,15 +70,15 @@ None yet. Populate `docs/DEVICE_COMPATIBILITY.md` only from real-device reports/
 
 ## Tests / CI
 
-A full hosted CI run has successfully completed:
+A full hosted CI run has successfully completed after the Gradle wrapper and final Phase 0/1 project cleanup were committed:
 
+- Gradle wrapper execution: passing.
 - Phase 1 unit tests: passing.
 - Android lint: passing.
 - Debug APK assembly: passing.
 - APK artifact publication: passing.
-- Gradle wrapper execution: passing.
 
-Final Phase 0/1 documentation cleanup is followed by one final CI run before device handoff.
+The remaining gate is physical-device validation, not hosted build correctness.
 
 ## Next Phase
 
