@@ -19,4 +19,5 @@ rootProject.name = "UniversalCamera"
 include(":app")
 include(":core-model")
 include(":camera-capability")
+include(":camera-camerax")
 include(":feature-camera")
