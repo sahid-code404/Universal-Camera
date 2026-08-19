@@ -6,7 +6,6 @@ import android.content.Context
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
-import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -44,6 +43,11 @@ enum class PhotoAspectRatio(val width: Int, val height: Int) {
     SIXTEEN_NINE(16, 9),
 }
 
+enum class PhotoOutputFormat {
+    HEIF,
+    JPEG,
+}
+
 enum class CameraFlashMode {
     OFF,
     AUTO,
@@ -57,17 +61,21 @@ sealed interface PhotoCaptureResult {
         val width: Int,
         val height: Int,
         val cameraId: String,
+        val requestedFormat: PhotoOutputFormat,
+        val actualFormat: PhotoOutputFormat,
+        val usedFormatFallback: Boolean,
     ) : PhotoCaptureResult
 
     data class Failure(val message: String) : PhotoCaptureResult
 }
 
 /**
- * Exact Camera2 photo controller used by the Phase 2 camera UI.
+ * Exact Camera2 photo controller used by the main OmniCam camera UI.
  *
- * CameraX remains available for devices where it is the best compatibility layer, but auxiliary
- * routing on some vendor HALs is filtered before CameraX selection. This controller therefore
- * supports both independently openable Camera2 IDs and standard physical-via-logical routing.
+ * The controller intentionally keeps direct Camera2 and physical-via-logical routing because
+ * vendor auxiliary cameras can be filtered by higher-level camera libraries. HEIF is requested
+ * directly from the camera HAL when the active route advertises ImageFormat.HEIC; JPEG is used as
+ * the compatibility fallback rather than transcoding a JPEG into HEIF and losing detail twice.
  */
 class Camera2PhotoController(
     context: Context,
@@ -86,22 +94,71 @@ class Camera2PhotoController(
     private var streamCharacteristics: CameraCharacteristics? = null
     private var activeRoute: ValuableCameraRoute? = null
     private var activeTextureView: TextureView? = null
+    private var activePreviewSize: Size? = null
+    private var activeImageFormat: Int = ImageFormat.JPEG
+    private var requestedPhotoFormat: PhotoOutputFormat = PhotoOutputFormat.HEIF
 
     private var currentZoomRatio = 1f
     private var currentExposureCompensation = 0
     private var currentFlashMode = CameraFlashMode.OFF
+    private var currentPhotoQuality = 100
 
     @SuppressLint("MissingPermission")
     suspend fun bind(
         textureView: TextureView,
         route: ValuableCameraRoute,
         aspectRatio: PhotoAspectRatio,
+        outputFormat: PhotoOutputFormat = PhotoOutputFormat.HEIF,
+        quality: Int = 100,
     ): CameraBindResult = withContext(Dispatchers.Main.immediate) {
         closeCurrent()
         currentZoomRatio = 1f
         currentExposureCompensation = 0
+        currentPhotoQuality = quality.coerceIn(1, 100)
+        requestedPhotoFormat = outputFormat
 
-        runCatching {
+        val preferredImageFormat = runCatching {
+            val streamCameraId = if (route.access == CameraRouteAccess.PHYSICAL_VIA_LOGICAL) {
+                route.camera.id
+            } else {
+                route.camera.id
+            }
+            val chars = cameraManager.getCameraCharacteristics(streamCameraId)
+            chooseImageFormat(chars, outputFormat)
+        }.getOrDefault(ImageFormat.JPEG)
+
+        val preferredResult = bindAttempt(
+            textureView = textureView,
+            route = route,
+            aspectRatio = aspectRatio,
+            imageFormat = preferredImageFormat,
+        )
+
+        if (
+            preferredResult is CameraBindResult.Failure &&
+            outputFormat == PhotoOutputFormat.HEIF &&
+            preferredImageFormat == ImageFormat.HEIC
+        ) {
+            closeCurrent()
+            bindAttempt(
+                textureView = textureView,
+                route = route,
+                aspectRatio = aspectRatio,
+                imageFormat = ImageFormat.JPEG,
+            )
+        } else {
+            preferredResult
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun bindAttempt(
+        textureView: TextureView,
+        route: ValuableCameraRoute,
+        aspectRatio: PhotoAspectRatio,
+        imageFormat: Int,
+    ): CameraBindResult {
+        return runCatching {
             val physicalId = route.camera.id.takeIf {
                 route.access == CameraRouteAccess.PHYSICAL_VIA_LOGICAL
             }
@@ -118,28 +175,31 @@ class Camera2PhotoController(
 
             val surfaceTexture = awaitSurfaceTexture(textureView)
             val previewSize = choosePreviewSize(streamChars, aspectRatio)
-            val captureSize = chooseCaptureSize(streamChars, aspectRatio)
+            val captureSize = chooseCaptureSize(streamChars, aspectRatio, imageFormat)
             surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
-            configureTransform(textureView, previewSize)
+            activePreviewSize = previewSize
+            configureTransform(textureView, previewSize, streamChars)
+            textureView.post { configureTransform(textureView, previewSize, streamChars) }
 
             val preview = Surface(surfaceTexture)
             val reader = ImageReader.newInstance(
                 captureSize.width,
                 captureSize.height,
-                ImageFormat.JPEG,
+                imageFormat,
                 2,
             )
 
             previewSurface = preview
             imageReader = reader
             activeTextureView = textureView
+            activeImageFormat = imageFormat
 
             val device = openCamera(deviceId)
             cameraDevice = device
             val session = createSession(
                 device = device,
                 preview = preview,
-                jpeg = reader.surface,
+                still = reader.surface,
                 physicalCameraId = physicalId,
             )
             captureSession = session
@@ -154,13 +214,11 @@ class Camera2PhotoController(
             applyRepeatingSettings()
             session.setRepeatingRequest(builder.build(), null, cameraHandler)
 
-            val minZoom = getMinZoom(streamChars)
-            val maxZoom = getMaxZoom(streamChars)
             CameraBindResult.Success(
                 requestedCameraId = route.camera.id,
                 actualCameraId = if (physicalId == null) deviceId else "$deviceId->$physicalId",
-                minZoomRatio = minZoom,
-                maxZoomRatio = maxZoom,
+                minZoomRatio = getMinZoom(streamChars),
+                maxZoomRatio = getMaxZoom(streamChars),
             )
         }.getOrElse { error ->
             closeCurrent()
@@ -169,6 +227,12 @@ class Camera2PhotoController(
                 reason = error.message ?: error::class.java.simpleName,
             )
         }
+    }
+
+    fun updatePreviewTransform(textureView: TextureView) {
+        val previewSize = activePreviewSize ?: return
+        val chars = streamCharacteristics ?: return
+        configureTransform(textureView, previewSize, chars)
     }
 
     fun setZoomRatio(ratio: Float) {
@@ -218,15 +282,9 @@ class Camera2PhotoController(
                 if ((chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) {
                     builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(metering))
                 }
-                builder.set(
-                    CaptureRequest.CONTROL_AF_TRIGGER,
-                    CaptureRequest.CONTROL_AF_TRIGGER_START,
-                )
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
                 session.capture(builder.build(), null, cameraHandler)
-                builder.set(
-                    CaptureRequest.CONTROL_AF_TRIGGER,
-                    CaptureRequest.CONTROL_AF_TRIGGER_IDLE,
-                )
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
                 applyRepeatingSettings()
                 session.setRepeatingRequest(builder.build(), null, cameraHandler)
             }
@@ -242,23 +300,25 @@ class Camera2PhotoController(
             val session = captureSession
                 ?: return@withContext PhotoCaptureResult.Failure("Capture session is unavailable")
             val reader = imageReader
-                ?: return@withContext PhotoCaptureResult.Failure("JPEG output is unavailable")
+                ?: return@withContext PhotoCaptureResult.Failure("Still-image output is unavailable")
             val chars = controlCharacteristics
                 ?: return@withContext PhotoCaptureResult.Failure("Camera metadata is unavailable")
 
             runCatching {
                 val frame = withTimeout(10_000) {
-                    suspendCancellableCoroutine<CapturedJpeg> { continuation ->
+                    suspendCancellableCoroutine<CapturedImage> { continuation ->
                         reader.setOnImageAvailableListener({ source ->
                             val image = runCatching { source.acquireNextImage() }.getOrNull()
                                 ?: return@setOnImageAvailableListener
                             image.use {
-                                val buffer = it.planes.first().buffer
+                                val plane = it.planes.firstOrNull()
+                                    ?: error("Encoded image contains no readable plane")
+                                val buffer = plane.buffer
                                 val data = ByteArray(buffer.remaining())
                                 buffer.get(data)
                                 if (continuation.isActive) {
                                     continuation.resume(
-                                        CapturedJpeg(
+                                        CapturedImage(
                                             bytes = data,
                                             width = it.width,
                                             height = it.height,
@@ -269,14 +329,12 @@ class Camera2PhotoController(
                             reader.setOnImageAvailableListener(null, null)
                         }, cameraHandler)
 
-                        val request = device.createCaptureRequest(
-                            CameraDevice.TEMPLATE_STILL_CAPTURE,
-                        ).apply {
+                        val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                             addTarget(reader.surface)
                             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                             setContinuousAfIfSupported(this, chars)
                             applyRequestSettings(this, chars, includeTorch = false)
-                            set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+                            set(CaptureRequest.JPEG_QUALITY, currentPhotoQuality.toByte())
                             set(
                                 CaptureRequest.JPEG_ORIENTATION,
                                 calculateJpegOrientation(chars, displayRotationDegrees),
@@ -287,9 +345,7 @@ class Camera2PhotoController(
                             session.capture(request.build(), null, cameraHandler)
                         }.onFailure { error ->
                             reader.setOnImageAvailableListener(null, null)
-                            if (continuation.isActive) {
-                                continuation.resumeWithException(error)
-                            }
+                            if (continuation.isActive) continuation.resumeWithException(error)
                         }
 
                         continuation.invokeOnCancellation {
@@ -298,17 +354,23 @@ class Camera2PhotoController(
                     }
                 }
 
-                val uri = saveJpeg(frame.bytes)
+                val actualFormat = if (activeImageFormat == ImageFormat.HEIC) {
+                    PhotoOutputFormat.HEIF
+                } else {
+                    PhotoOutputFormat.JPEG
+                }
+                val uri = saveEncoded(frame.bytes, actualFormat)
                 PhotoCaptureResult.Success(
                     uri = uri,
                     width = frame.width,
                     height = frame.height,
                     cameraId = route.camera.id,
+                    requestedFormat = requestedPhotoFormat,
+                    actualFormat = actualFormat,
+                    usedFormatFallback = requestedPhotoFormat != actualFormat,
                 )
             }.getOrElse { error ->
-                PhotoCaptureResult.Failure(
-                    error.message ?: error::class.java.simpleName,
-                )
+                PhotoCaptureResult.Failure(error.message ?: error::class.java.simpleName)
             }
         }
 
@@ -367,17 +429,11 @@ class Camera2PhotoController(
                 builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
             }
             CameraFlashMode.AUTO -> {
-                builder.set(
-                    CaptureRequest.CONTROL_AE_MODE,
-                    CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH,
-                )
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
                 builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
             }
             CameraFlashMode.ON -> {
-                builder.set(
-                    CaptureRequest.CONTROL_AE_MODE,
-                    CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH,
-                )
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH)
                 builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
             }
             CameraFlashMode.TORCH -> {
@@ -438,12 +494,17 @@ class Camera2PhotoController(
         }
     }
 
-    private suspend fun saveJpeg(bytes: ByteArray): Uri = withContext(Dispatchers.IO) {
+    private suspend fun saveEncoded(
+        bytes: ByteArray,
+        format: PhotoOutputFormat,
+    ): Uri = withContext(Dispatchers.IO) {
         val resolver = appContext.contentResolver
-        val name = "OMNI_${SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())}.jpg"
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val extension = if (format == PhotoOutputFormat.HEIF) "heic" else "jpg"
+        val mimeType = if (format == PhotoOutputFormat.HEIF) "image/heic" else "image/jpeg"
         val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, name)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.DISPLAY_NAME, "OMNI_${timestamp}.$extension")
+            put(MediaStore.Images.Media.MIME_TYPE, mimeType)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 put(
                     MediaStore.Images.Media.RELATIVE_PATH,
@@ -453,8 +514,7 @@ class Camera2PhotoController(
             }
         }
 
-        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val uri = resolver.insert(collection, values)
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             ?: error("MediaStore could not create a destination")
 
         try {
@@ -478,6 +538,19 @@ class Camera2PhotoController(
         }
     }
 
+    private fun chooseImageFormat(
+        chars: CameraCharacteristics,
+        requested: PhotoOutputFormat,
+    ): Int {
+        if (requested == PhotoOutputFormat.JPEG || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return ImageFormat.JPEG
+        }
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: return ImageFormat.JPEG
+        val heicSizes = runCatching { map.getOutputSizes(ImageFormat.HEIC) }.getOrNull().orEmpty()
+        return if (heicSizes.isNotEmpty()) ImageFormat.HEIC else ImageFormat.JPEG
+    }
+
     private fun choosePreviewSize(
         chars: CameraCharacteristics,
         ratio: PhotoAspectRatio,
@@ -490,8 +563,7 @@ class Camera2PhotoController(
 
         val maxPixels = 1920L * 1080L
         val matching = sizes.filter { size ->
-            ratioDifference(size, ratio) < 0.035f &&
-                size.width.toLong() * size.height.toLong() <= maxPixels
+            ratioDifference(size, ratio) < 0.035f && pixels(size) <= maxPixels
         }
         return matching.maxByOrNull(::pixels)
             ?: sizes.filter { pixels(it) <= maxPixels }.minByOrNull { ratioDifference(it, ratio) }
@@ -501,13 +573,16 @@ class Camera2PhotoController(
     private fun chooseCaptureSize(
         chars: CameraCharacteristics,
         ratio: PhotoAspectRatio,
+        format: Int,
     ): Size {
-        val sizes = chars
-            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?.getOutputSizes(ImageFormat.JPEG)
-            .orEmpty()
-        if (sizes.isEmpty()) return Size(1920, 1440)
-
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val sizes = runCatching { map?.getOutputSizes(format) }.getOrNull().orEmpty()
+        if (sizes.isEmpty()) {
+            val fallback = map?.getOutputSizes(ImageFormat.JPEG).orEmpty()
+            if (fallback.isEmpty()) return Size(1920, 1440)
+            val matchingFallback = fallback.filter { ratioDifference(it, ratio) < 0.035f }
+            return (matchingFallback.ifEmpty { fallback.toList() }).maxBy(::pixels)
+        }
         val matching = sizes.filter { ratioDifference(it, ratio) < 0.035f }
         return (matching.ifEmpty { sizes.toList() }).maxBy(::pixels)
     }
@@ -520,37 +595,90 @@ class Camera2PhotoController(
 
     private fun pixels(size: Size): Long = size.width.toLong() * size.height.toLong()
 
-    private fun configureTransform(textureView: TextureView, previewSize: Size) {
+    /**
+     * Correct the TextureView's default non-uniform scaling. This follows Android's Camera2
+     * resizable-surface guidance: reverse the implicit X/Y stretch, apply one uniform scale, then
+     * compensate for display rotation. The result may crop, but it never stretches faces/objects.
+     */
+    private fun configureTransform(
+        textureView: TextureView,
+        previewSize: Size,
+        chars: CameraCharacteristics,
+    ) {
         if (textureView.width <= 0 || textureView.height <= 0) return
-        val rotation = textureView.display?.rotation ?: Surface.ROTATION_0
-        val viewRect = RectF(0f, 0f, textureView.width.toFloat(), textureView.height.toFloat())
-        val centerX = viewRect.centerX()
-        val centerY = viewRect.centerY()
+
+        val surfaceRotation = textureView.display?.rotation ?: Surface.ROTATION_0
+        val surfaceRotationDegrees = when (surfaceRotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        val windowSize = Size(textureView.width, textureView.height)
+        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val isRotationRequired = computeRelativeRotation(chars, surfaceRotationDegrees) % 180 != 0
+
+        var scaleX: Float
+        var scaleY: Float
+        if (sensorOrientation == 0) {
+            scaleX = if (!isRotationRequired) {
+                windowSize.width.toFloat() / previewSize.height
+            } else {
+                windowSize.width.toFloat() / previewSize.width
+            }
+            scaleY = if (!isRotationRequired) {
+                windowSize.height.toFloat() / previewSize.width
+            } else {
+                windowSize.height.toFloat() / previewSize.height
+            }
+        } else {
+            scaleX = if (isRotationRequired) {
+                windowSize.width.toFloat() / previewSize.height
+            } else {
+                windowSize.width.toFloat() / previewSize.width
+            }
+            scaleY = if (isRotationRequired) {
+                windowSize.height.toFloat() / previewSize.width
+            } else {
+                windowSize.height.toFloat() / previewSize.height
+            }
+        }
+
+        if (scaleX == 0f || scaleY == 0f) return
+        val finalScale = max(scaleX, scaleY)
+        val halfWidth = windowSize.width / 2f
+        val halfHeight = windowSize.height / 2f
         val matrix = Matrix()
 
-        if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
-            val bufferRect = RectF(
-                0f,
-                0f,
-                previewSize.height.toFloat(),
-                previewSize.width.toFloat(),
+        if (isRotationRequired) {
+            matrix.setScale(
+                1f / scaleX * finalScale,
+                1f / scaleY * finalScale,
+                halfWidth,
+                halfHeight,
             )
-            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
-            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-            val scale = max(
-                textureView.height.toFloat() / previewSize.height,
-                textureView.width.toFloat() / previewSize.width,
+        } else {
+            matrix.setScale(
+                windowSize.height / windowSize.width.toFloat() / scaleY * finalScale,
+                windowSize.width / windowSize.height.toFloat() / scaleX * finalScale,
+                halfWidth,
+                halfHeight,
             )
-            matrix.postScale(scale, scale, centerX, centerY)
-            matrix.postRotate(
-                if (rotation == Surface.ROTATION_90) 90f else -90f,
-                centerX,
-                centerY,
-            )
-        } else if (rotation == Surface.ROTATION_180) {
-            matrix.postRotate(180f, centerX, centerY)
         }
+
+        matrix.postRotate(-surfaceRotationDegrees.toFloat(), halfWidth, halfHeight)
         textureView.setTransform(matrix)
+    }
+
+    private fun computeRelativeRotation(
+        chars: CameraCharacteristics,
+        deviceOrientationDegrees: Int,
+    ): Int {
+        val sensorOrientationDegrees = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val sign = if (
+            chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+        ) 1 else -1
+        return (sensorOrientationDegrees - deviceOrientationDegrees * sign + 360) % 360
     }
 
     private fun setContinuousAfIfSupported(
@@ -611,7 +739,7 @@ class Camera2PhotoController(
     private suspend fun createSession(
         device: CameraDevice,
         preview: Surface,
-        jpeg: Surface,
+        still: Surface,
         physicalCameraId: String?,
     ): CameraCaptureSession = suspendCancellableCoroutine { continuation ->
         val callback = object : CameraCaptureSession.StateCallback() {
@@ -632,20 +760,16 @@ class Camera2PhotoController(
         try {
             @Suppress("DEPRECATION")
             if (physicalCameraId == null) {
-                device.createCaptureSession(
-                    listOf(preview, jpeg),
-                    callback,
-                    cameraHandler,
-                )
+                device.createCaptureSession(listOf(preview, still), callback, cameraHandler)
             } else {
                 val previewOutput = OutputConfiguration(preview).apply {
                     setPhysicalCameraId(physicalCameraId)
                 }
-                val jpegOutput = OutputConfiguration(jpeg).apply {
+                val stillOutput = OutputConfiguration(still).apply {
                     setPhysicalCameraId(physicalCameraId)
                 }
                 device.createCaptureSessionByOutputConfigurations(
-                    listOf(previewOutput, jpegOutput),
+                    listOf(previewOutput, stillOutput),
                     callback,
                     cameraHandler,
                 )
@@ -708,6 +832,8 @@ class Camera2PhotoController(
         streamCharacteristics = null
         activeRoute = null
         activeTextureView = null
+        activePreviewSize = null
+        activeImageFormat = ImageFormat.JPEG
     }
 
     private fun cameraErrorName(error: Int): String = when (error) {
@@ -719,7 +845,7 @@ class Camera2PhotoController(
         else -> "UNKNOWN"
     }
 
-    private data class CapturedJpeg(
+    private data class CapturedImage(
         val bytes: ByteArray,
         val width: Int,
         val height: Int,
