@@ -5,6 +5,7 @@ import com.omnicam.app.update.DevUpdateManager
 import com.omnicam.camera.camerax.Camera2AuxPreviewController
 import com.omnicam.camera.camerax.Camera2PhotoController
 import com.omnicam.camera.camerax.ComputationalRawController
+import com.omnicam.camera.camerax.LightningRawController
 import com.omnicam.camera.capability.AndroidCameraCapabilityScanner
 import com.omnicam.camera.capability.CameraCapabilityScanner
 import com.omnicam.feature.camera.DataStoreLensPreferencesStore
@@ -16,6 +17,9 @@ class OmniCamApplication : Application() {
 
 class AppContainer(application: Application) {
     val cameraCapabilityScanner: CameraCapabilityScanner = AndroidCameraCapabilityScanner(application)
+    val lightningRawController = LightningRawController(application)
+
+    // Kept internally for diagnostics/regression only. The launcher exposes only Lightning C1.7.
     val camera2AuxPreviewController = Camera2AuxPreviewController(application)
     val camera2PhotoController = Camera2PhotoController(application)
     val computationalRawController = ComputationalRawController(application)
