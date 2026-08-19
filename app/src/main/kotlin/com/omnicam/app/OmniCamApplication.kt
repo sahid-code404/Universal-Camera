@@ -2,7 +2,7 @@ package com.omnicam.app
 
 import android.app.Application
 import com.omnicam.app.update.DevUpdateManager
-import com.omnicam.camera.camerax.LightningRawController
+import com.omnicam.camera.camerax.DngOnlyCameraController
 import com.omnicam.camera.capability.AndroidCameraCapabilityScanner
 import com.omnicam.camera.capability.CameraCapabilityScanner
 
@@ -12,6 +12,6 @@ class OmniCamApplication : Application() {
 
 class AppContainer(application: Application) {
     val cameraCapabilityScanner: CameraCapabilityScanner = AndroidCameraCapabilityScanner(application)
-    val lightningRawController = LightningRawController(application)
+    val dngCameraController = DngOnlyCameraController(application)
     val devUpdateManager = DevUpdateManager(application)
 }
