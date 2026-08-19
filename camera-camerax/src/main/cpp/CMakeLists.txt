@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(omnicam_raw LANGUAGES CXX)
 
-add_library(omnicam_raw SHARED native_raw_processor.cpp)
+add_library(
+    omnicam_raw
+    SHARED
+    native_raw_processor.cpp
+    native_raw_resampler.cpp
+)
 
 target_compile_features(omnicam_raw PRIVATE cxx_std_20)
 target_compile_options(
