@@ -3,7 +3,7 @@ package com.omnicam.camera.camerax
 import android.graphics.Bitmap
 import java.nio.ByteBuffer
 
-/** JNI bridge for the C1.7 low-latency native RAW pipeline. */
+/** JNI bridge for OmniCam's low-latency native RAW pipeline. */
 internal object NativeRawBridge {
     val available: Boolean
     val loadFailure: String?
@@ -45,5 +45,19 @@ internal object NativeRawBridge {
         highlightProtection: Float,
         denoiseStrength: Float,
         outputBitmap: Bitmap,
+    ): Int
+
+    /**
+     * Center-crop a Bayer RAW frame by [zoomRatio] and interpolate each CFA plane independently
+     * back into the original RAW dimensions. This keeps a standards-compatible native-size DNG
+     * canvas while making its field of view match the processed preview digital zoom.
+     */
+    @JvmStatic
+    external fun resampleRawZoom(
+        inputRaw16: ByteBuffer,
+        width: Int,
+        height: Int,
+        zoomRatio: Float,
+        outputRaw16: ByteBuffer,
     ): Int
 }
