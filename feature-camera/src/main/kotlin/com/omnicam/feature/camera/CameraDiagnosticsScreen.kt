@@ -40,6 +40,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.omnicam.camera.capability.toSanitizedJson
 import com.omnicam.core.model.CameraDescriptor
 import com.omnicam.core.model.DeviceCameraProfile
+import com.omnicam.core.model.PublicCameraExposureAssessment
 import java.util.Locale
 
 @Composable
@@ -164,7 +165,7 @@ private fun DiagnosticsContent(
                     )
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        "${profile.cameras.count { it.directlyListed }} public camera IDs · ${profile.logicalGroups.size} logical multi-camera groups",
+                        "${profile.cameras.count { it.directlyListed }} Camera2 IDs · ${profile.logicalGroups.size} logical multi-camera groups",
                         style = MaterialTheme.typography.titleMedium,
                     )
                     Spacer(Modifier.height(14.dp))
@@ -173,6 +174,7 @@ private fun DiagnosticsContent(
                         OutlinedButton(onClick = onRetry) { Text("Rescan") }
                     }
                 }
+                item { PublicExposureProbeCard(profile) }
                 items(profile.cameras, key = { it.id }) { camera -> CameraCard(camera) }
                 item {
                     Text(
@@ -181,6 +183,50 @@ private fun DiagnosticsContent(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun PublicExposureProbeCard(profile: DeviceCameraProfile) {
+    val camera2Count = profile.cameras.count { it.directlyListed }
+    val legacyCount = profile.legacyCameraCount?.toString() ?: "unavailable"
+    val assessmentText = when (profile.publicExposureAssessment) {
+        PublicCameraExposureAssessment.MULTIPLE_CAMERA2_IDS ->
+            "Android Camera2 exposes multiple cameras on at least one side. Auxiliary routing can be tested directly."
+        PublicCameraExposureAssessment.LOGICAL_MULTI_CAMERA_EXPOSED ->
+            "Android exposes a logical multi-camera group. Its physical members can be investigated through public logical/physical camera APIs."
+        PublicCameraExposureAssessment.LEGACY_API_SEES_ADDITIONAL_CAMERAS ->
+            "The legacy Camera1 API sees more camera devices than Camera2. This is an important vendor-specific public-API path to test next."
+        PublicCameraExposureAssessment.AUXILIARY_NOT_EXPOSED_BY_STANDARD_DISCOVERY ->
+            "No additional auxiliary camera is exposed by standard Camera2 or Camera1 enumeration. The ROM/HAL is likely restricting those sensors to OEM or privileged camera software."
+        PublicCameraExposureAssessment.UNKNOWN ->
+            "The public API exposure result is inconclusive."
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+    ) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Public API exposure probe", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("Camera2 IDs: $camera2Count · Camera1 devices: $legacyCount · logical groups: ${profile.logicalGroups.size}")
+            if (profile.legacyCameras.isNotEmpty()) {
+                Text(
+                    "Camera1: " + profile.legacyCameras.joinToString { camera ->
+                        "#${camera.index} ${camera.lensFacing} ${camera.orientationDegrees}°"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            if (profile.concurrentCameraIdSets.isNotEmpty()) {
+                Text(
+                    "Concurrent Camera2 sets: ${profile.concurrentCameraIdSets.joinToString { it.joinToString(prefix = "[", postfix = "]") }}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Text(assessmentText, style = MaterialTheme.typography.bodyMedium)
         }
     }
 }
