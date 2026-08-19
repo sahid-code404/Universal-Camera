@@ -92,7 +92,7 @@ class CameraXPreviewController(
         val cameraId = boundCameraId
             ?: return@withContext CaptureProbeResult.Failure("Camera ID is unavailable")
 
-        suspendCancellableCoroutine { continuation ->
+        suspendCancellableCoroutine<CaptureProbeResult> { continuation ->
             capture.takePicture(
                 ContextCompat.getMainExecutor(appContext),
                 object : ImageCapture.OnImageCapturedCallback() {
