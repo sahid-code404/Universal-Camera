@@ -120,7 +120,9 @@ class AndroidCameraCapabilityScanner(
             OutputFormatCapability(
                 format = format,
                 formatName = imageFormatName(format),
-                sizes = runCatching { streamMap.getOutputSizes(format)?.map(Size::toModel).orEmpty() }.getOrDefault(emptyList()),
+                sizes = runCatching {
+                    streamMap.getOutputSizes(format)?.map { size -> size.toModel() }.orEmpty()
+                }.getOrDefault(emptyList()),
             )
         }.orEmpty()
 
@@ -162,7 +164,7 @@ class AndroidCameraCapabilityScanner(
             exposureTimeRangeNs = characteristics[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE]?.toLongRange(),
             aeCompensationRange = characteristics[CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE]?.toIntRange(),
             targetFpsRanges = characteristics[CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES]
-                ?.map(Range<Int>::toIntRange)
+                ?.map { range -> range.toIntRange() }
                 .orEmpty(),
             outputFormats = outputFormats,
             classification = classification,
