@@ -20,7 +20,12 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             OmniCamTheme {
-                OmniCamApp(diagnosticsViewModel = diagnosticsViewModel)
+                val container = (application as OmniCamApplication).appContainer
+                OmniCamApp(
+                    diagnosticsViewModel = diagnosticsViewModel,
+                    scanner = container.cameraCapabilityScanner,
+                    previewController = container.cameraXPreviewController,
+                )
             }
         }
     }
