@@ -4,8 +4,8 @@ import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.ImageFormat
-import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -13,10 +13,11 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.DngCreator
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaCodecList
@@ -29,7 +30,9 @@ import android.os.HandlerThread
 import android.provider.MediaStore
 import android.util.Size
 import android.view.Surface
-import android.view.TextureView
+import androidx.camera.viewfinder.core.TransformationInfo
+import androidx.camera.viewfinder.core.ViewfinderSurfaceRequest
+import androidx.camera.viewfinder.core.camera2.Camera2TransformationInfo
 import androidx.heifwriter.HeifWriter
 import com.omnicam.camera.capability.CameraRouteAccess
 import com.omnicam.camera.capability.ValuableCameraRoute
@@ -81,6 +84,13 @@ data class ProControls(
     val focusDistanceDiopters: Float? = null,
 )
 
+data class CameraViewfinderSpec(
+    val surfaceRequest: ViewfinderSurfaceRequest,
+    val transformationInfo: TransformationInfo,
+    val previewSize: Size,
+    val visibleSourceCrop: RectF,
+)
+
 enum class CameraFlashMode {
     OFF,
     AUTO,
@@ -112,9 +122,14 @@ sealed interface PhotoCaptureResult {
 /**
  * Exact Camera2 still controller used by OmniCam.
  *
- * HEIF order: native Camera2 HEIC -> YUV_420_888 + AndroidX HeifWriter -> JPEG fallback.
- * Software HEIF and DNG file finalization run off the shutter path so the preview can continue
- * immediately after a frame has been acquired.
+ * Architecture:
+ * - AndroidX Camera Viewfinder owns preview scaling/rotation/mirroring and Surface lifecycle.
+ * - Preview resolution is selected independently from photo aspect ratio so 1:1 never forces a
+ *   tiny preview stream.
+ * - Still resolution merges normal and high-resolution Camera2 output lists and tries the largest
+ *   compatible stream first.
+ * - Native HEIC is preferred, then full-resolution YUV + HEVC HEIF, then JPEG compatibility.
+ * - DNG uses RAW_SENSOR + TotalCaptureResult and DngCreator.
  */
 class Camera2PhotoController(
     context: Context,
@@ -133,8 +148,8 @@ class Camera2PhotoController(
     private var controlCharacteristics: CameraCharacteristics? = null
     private var streamCharacteristics: CameraCharacteristics? = null
     private var activeRoute: ValuableCameraRoute? = null
-    private var activeTextureView: TextureView? = null
     private var activePreviewSize: Size? = null
+    private var activeCaptureSize: Size? = null
     private var activeAspectRatio: PhotoAspectRatio = PhotoAspectRatio.FOUR_THREE
     private var activeStillPipeline: StillPipeline = StillPipeline.JPEG
     private var requestedPhotoFormat: PhotoOutputFormat = PhotoOutputFormat.HEIF
@@ -145,8 +160,55 @@ class Camera2PhotoController(
     private var currentPhotoQuality = 100
     private var currentProControls = ProControls()
 
+    /**
+     * Prepares the standalone AndroidX Camera Viewfinder. The source stream keeps a camera-native
+     * aspect ratio; the selected photo aspect is expressed as a crop ROI in TransformationInfo.
+     */
+    fun createViewfinderSpec(
+        route: ValuableCameraRoute,
+        aspectRatio: PhotoAspectRatio,
+        sessionKey: String = "",
+    ): CameraViewfinderSpec {
+        val ids = resolveRoute(route)
+        val chars = cameraManager.getCameraCharacteristics(ids.physicalId ?: ids.deviceId)
+        val previewSize = choosePreviewSize(chars)
+        val crop = centerCropRect(previewSize, aspectRatio)
+        val transformation = Camera2TransformationInfo.createFromCharacteristics(
+            chars,
+            crop.left,
+            crop.top,
+            crop.right,
+            crop.bottom,
+        )
+        val request = ViewfinderSurfaceRequest(
+            width = previewSize.width,
+            height = previewSize.height,
+            requestId = buildString {
+                append(route.camera.id)
+                append(':')
+                append(aspectRatio.name)
+                append(':')
+                append(previewSize.width)
+                append('x')
+                append(previewSize.height)
+                if (sessionKey.isNotBlank()) {
+                    append(':')
+                    append(sessionKey)
+                }
+            },
+        )
+        return CameraViewfinderSpec(
+            surfaceRequest = request,
+            transformationInfo = transformation,
+            previewSize = previewSize,
+            visibleSourceCrop = crop,
+        )
+    }
+
+    @SuppressLint("MissingPermission")
     suspend fun bind(
-        textureView: TextureView,
+        surface: Surface,
+        spec: CameraViewfinderSpec,
         route: ValuableCameraRoute,
         aspectRatio: PhotoAspectRatio,
         outputFormat: PhotoOutputFormat = PhotoOutputFormat.HEIF,
@@ -159,15 +221,25 @@ class Camera2PhotoController(
         requestedPhotoFormat = outputFormat
         activeAspectRatio = aspectRatio
 
+        val ids = resolveRoute(route)
         val streamChars = runCatching {
-            cameraManager.getCameraCharacteristics(route.camera.id)
+            cameraManager.getCameraCharacteristics(ids.physicalId ?: ids.deviceId)
         }.getOrNull()
-        val candidates = pipelineCandidates(streamChars, route, outputFormat, aspectRatio)
+            ?: return@withContext CameraBindResult.Failure(
+                cameraId = route.camera.id,
+                reason = "Camera characteristics are unavailable",
+            )
+        val candidates = buildStillCandidates(streamChars, route, outputFormat, aspectRatio)
         var lastFailure: CameraBindResult.Failure? = null
 
-        for (pipeline in candidates) {
+        for (candidate in candidates) {
             closeCurrent()
-            val result = bindAttempt(textureView, route, aspectRatio, pipeline)
+            val result = bindAttempt(
+                surface = surface,
+                spec = spec,
+                route = route,
+                candidate = candidate,
+            )
             if (result is CameraBindResult.Success) return@withContext result
             lastFailure = result as CameraBindResult.Failure
         }
@@ -180,53 +252,42 @@ class Camera2PhotoController(
 
     @SuppressLint("MissingPermission")
     private suspend fun bindAttempt(
-        textureView: TextureView,
+        surface: Surface,
+        spec: CameraViewfinderSpec,
         route: ValuableCameraRoute,
-        aspectRatio: PhotoAspectRatio,
-        pipeline: StillPipeline,
+        candidate: StillCandidate,
     ): CameraBindResult = runCatching {
-        val physicalId = route.camera.id.takeIf {
-            route.access == CameraRouteAccess.PHYSICAL_VIA_LOGICAL
-        }
-        val deviceId = when (route.access) {
-            CameraRouteAccess.DIRECT_CAMERA_DEVICE -> route.camera.id
-            CameraRouteAccess.PHYSICAL_VIA_LOGICAL -> route.logicalCameraIds.firstOrNull()
-                ?: error("Physical camera ${route.camera.id} has no logical parent")
-        }
-
-        val streamChars = cameraManager.getCameraCharacteristics(physicalId ?: deviceId)
-        val controlChars = cameraManager.getCameraCharacteristics(deviceId)
+        val ids = resolveRoute(route)
+        val streamChars = cameraManager.getCameraCharacteristics(ids.physicalId ?: ids.deviceId)
+        val controlChars = cameraManager.getCameraCharacteristics(ids.deviceId)
         streamCharacteristics = streamChars
         controlCharacteristics = controlChars
+        activePreviewSize = spec.previewSize
 
-        val surfaceTexture = awaitSurfaceTexture(textureView)
-        val previewSize = choosePreviewSize(streamChars, aspectRatio)
-        val captureSize = chooseCaptureSize(streamChars, aspectRatio, pipeline.imageFormat)
-        surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
-        activePreviewSize = previewSize
-        configureTransform(textureView, previewSize, streamChars)
-        textureView.post { configureTransform(textureView, previewSize, streamChars) }
-
-        val preview = Surface(surfaceTexture)
         val reader = ImageReader.newInstance(
-            captureSize.width,
-            captureSize.height,
-            pipeline.imageFormat,
+            candidate.size.width,
+            candidate.size.height,
+            candidate.pipeline.imageFormat,
             2,
         )
-        previewSurface = preview
+        previewSurface = surface
         imageReader = reader
-        activeTextureView = textureView
-        activeStillPipeline = pipeline
-        activeAspectRatio = aspectRatio
+        activeStillPipeline = candidate.pipeline
+        activeCaptureSize = candidate.size
+        activeAspectRatio = activeAspectRatio
 
-        val device = openCamera(deviceId)
+        val device = openCamera(ids.deviceId)
         cameraDevice = device
-        val session = createSession(device, preview, reader.surface, physicalId)
+        val session = createSession(
+            device = device,
+            preview = surface,
+            still = reader.surface,
+            physicalCameraId = ids.physicalId,
+        )
         captureSession = session
 
         val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-            addTarget(preview)
+            addTarget(surface)
             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             setContinuousAfIfSupported(this, controlChars)
         }
@@ -237,7 +298,11 @@ class Camera2PhotoController(
 
         CameraBindResult.Success(
             requestedCameraId = route.camera.id,
-            actualCameraId = if (physicalId == null) deviceId else "$deviceId->$physicalId",
+            actualCameraId = if (ids.physicalId == null) {
+                ids.deviceId
+            } else {
+                "${ids.deviceId}->${ids.physicalId}"
+            },
             minZoomRatio = getMinZoom(streamChars),
             maxZoomRatio = getMaxZoom(streamChars),
         )
@@ -247,12 +312,6 @@ class Camera2PhotoController(
             cameraId = route.camera.id,
             reason = error.message ?: error::class.java.simpleName,
         )
-    }
-
-    fun updatePreviewTransform(textureView: TextureView) {
-        val previewSize = activePreviewSize ?: return
-        val chars = streamCharacteristics ?: return
-        configureTransform(textureView, previewSize, chars)
     }
 
     fun setZoomRatio(ratio: Float) {
@@ -279,30 +338,46 @@ class Camera2PhotoController(
         refreshRepeating()
     }
 
-    fun focusAt(normalizedX: Float, normalizedY: Float) {
-        if (currentProControls.enabled) return
-        val chars = controlCharacteristics ?: return
+    /**
+     * Receives coordinates already transformed by AndroidX Viewfinder from Compose/view space into
+     * source-buffer coordinates, then maps that buffer into the sensor region used by this stream.
+     */
+    fun focusAtSurface(
+        sourceX: Float,
+        sourceY: Float,
+        sourceWidth: Int,
+        sourceHeight: Int,
+    ) {
+        if (currentProControls.enabled || sourceWidth <= 0 || sourceHeight <= 0) return
+        val streamChars = streamCharacteristics ?: return
+        val controlChars = controlCharacteristics ?: streamChars
         val session = captureSession ?: return
         val builder = previewBuilder ?: return
-        val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
-        if ((chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) <= 0) return
+        if ((controlChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) <= 0) return
 
-        val x = (activeArray.left + normalizedX.coerceIn(0f, 1f) * activeArray.width()).toInt()
-        val y = (activeArray.top + normalizedY.coerceIn(0f, 1f) * activeArray.height()).toInt()
-        val half = max(40, minOf(activeArray.width(), activeArray.height()) / 14)
+        val previewSize = activePreviewSize ?: Size(sourceWidth, sourceHeight)
+        val sensorRect = effectivePreviewSensorRect(streamChars, previewSize) ?: return
+        val nx = (sourceX / sourceWidth.toFloat()).coerceIn(0f, 1f)
+        val ny = (sourceY / sourceHeight.toFloat()).coerceIn(0f, 1f)
+        val x = (sensorRect.left + nx * sensorRect.width()).roundToInt()
+        val y = (sensorRect.top + ny * sensorRect.height()).roundToInt()
+        val half = max(32, min(sensorRect.width(), sensorRect.height()) / 24)
         val focusRect = Rect(
-            (x - half).coerceIn(activeArray.left, activeArray.right - 2),
-            (y - half).coerceIn(activeArray.top, activeArray.bottom - 2),
-            (x + half).coerceIn(activeArray.left + 2, activeArray.right),
-            (y + half).coerceIn(activeArray.top + 2, activeArray.bottom),
+            (x - half).coerceIn(sensorRect.left, sensorRect.right - 2),
+            (y - half).coerceIn(sensorRect.top, sensorRect.bottom - 2),
+            (x + half).coerceIn(sensorRect.left + 2, sensorRect.right),
+            (y + half).coerceIn(sensorRect.top + 2, sensorRect.bottom),
         )
-        val metering = MeteringRectangle(focusRect, MeteringRectangle.METERING_WEIGHT_MAX - 1)
+        val metering = MeteringRectangle(
+            focusRect,
+            MeteringRectangle.METERING_WEIGHT_MAX - 1,
+        )
 
         cameraHandler.post {
             runCatching {
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                 builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(metering))
-                if ((chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) {
+                if ((controlChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) {
                     builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(metering))
                 }
                 builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
@@ -342,7 +417,7 @@ class Camera2PhotoController(
                     val processing = PhotoCaptureResult.Processing(
                         cameraId = route.camera.id,
                         requestedFormat = requestedFormat,
-                        message = "RAW captured · writing DNG",
+                        message = "RAW ${rawFrame.width}x${rawFrame.height} captured · writing DNG",
                     )
                     saveScope.launch {
                         val finalResult = runCatching {
@@ -357,7 +432,7 @@ class Camera2PhotoController(
                                 usedFormatFallback = requestedFormat != PhotoOutputFormat.DNG,
                             )
                         }.getOrElse { error ->
-                            rawFrame.image.close()
+                            runCatching { rawFrame.image.close() }
                             PhotoCaptureResult.Failure(error.message ?: error::class.java.simpleName)
                         }
                         withContext(Dispatchers.Main.immediate) { onFinalized(finalResult) }
@@ -369,14 +444,23 @@ class Camera2PhotoController(
                 StillPipeline.SOFTWARE_HEIF,
                 StillPipeline.JPEG,
                 -> {
-                    val frame = captureStandardFrame(device, session, reader, chars, pipeline, rotation)
+                    val frame = captureStandardFrame(
+                        device = device,
+                        session = session,
+                        reader = reader,
+                        chars = chars,
+                        pipeline = pipeline,
+                        rotation = rotation,
+                    )
                     val processing = PhotoCaptureResult.Processing(
                         cameraId = route.camera.id,
                         requestedFormat = requestedFormat,
                         message = when (pipeline) {
-                            StillPipeline.SOFTWARE_HEIF -> "Captured · encoding HEIF in background"
-                            StillPipeline.NATIVE_HEIF -> "Captured · publishing HEIF"
-                            else -> "Captured · saving photo"
+                            StillPipeline.SOFTWARE_HEIF ->
+                                "Captured ${frame.width}x${frame.height} · encoding HEIF in background"
+                            StillPipeline.NATIVE_HEIF ->
+                                "Captured ${frame.width}x${frame.height} · publishing HEIF"
+                            else -> "Captured ${frame.width}x${frame.height} · saving photo"
                         },
                     )
                     saveScope.launch {
@@ -644,7 +728,9 @@ class Camera2PhotoController(
                 )
             }
         } else {
-            applyLegacyCrop(builder, streamChars, currentZoomRatio)
+            calculateLegacyZoomCrop(streamChars, currentZoomRatio)?.let { crop ->
+                builder.set(CaptureRequest.SCALER_CROP_REGION, crop)
+            }
         }
     }
 
@@ -682,23 +768,32 @@ class Camera2PhotoController(
         }
     }
 
-    private fun applyLegacyCrop(
-        builder: CaptureRequest.Builder,
+    private fun calculateLegacyZoomCrop(
         chars: CameraCharacteristics,
         zoomRatio: Float,
-    ) {
-        if (zoomRatio <= 1f) return
-        val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+    ): Rect? {
+        val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return null
+        if (zoomRatio <= 1f) return Rect(active)
         val maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
         val zoom = zoomRatio.coerceIn(1f, maxZoom)
-        val cropWidth = (active.width() / zoom).toInt()
-        val cropHeight = (active.height() / zoom).toInt()
+        val cropWidth = (active.width() / zoom).roundToInt().coerceAtLeast(2)
+        val cropHeight = (active.height() / zoom).roundToInt().coerceAtLeast(2)
         val left = active.left + (active.width() - cropWidth) / 2
         val top = active.top + (active.height() - cropHeight) / 2
-        builder.set(
-            CaptureRequest.SCALER_CROP_REGION,
-            Rect(left, top, left + cropWidth, top + cropHeight),
-        )
+        return Rect(left, top, left + cropWidth, top + cropHeight)
+    }
+
+    private fun effectivePreviewSensorRect(
+        chars: CameraCharacteristics,
+        previewSize: Size,
+    ): Rect? {
+        val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return null
+        val zoomBase = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            calculateLegacyZoomCrop(chars, currentZoomRatio) ?: Rect(active)
+        } else {
+            Rect(active)
+        }
+        return centerCropRect(zoomBase, previewSize.width.toFloat() / previewSize.height.toFloat())
     }
 
     private fun getMinZoom(chars: CameraCharacteristics): Float =
@@ -852,48 +947,98 @@ class Camera2PhotoController(
         }
     }
 
-    private fun pipelineCandidates(
-        chars: CameraCharacteristics?,
+    private fun buildStillCandidates(
+        chars: CameraCharacteristics,
         route: ValuableCameraRoute,
         requested: PhotoOutputFormat,
         ratio: PhotoAspectRatio,
-    ): List<StillPipeline> {
-        if (chars == null) return listOf(StillPipeline.JPEG)
+    ): List<StillCandidate> {
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: return emptyList()
+        val result = mutableListOf<StillCandidate>()
+
+        fun addCandidates(
+            pipeline: StillPipeline,
+            sizes: List<Size>,
+            cropAfterCapture: Boolean = false,
+        ) {
+            val ranked = if (cropAfterCapture) {
+                sizes.sortedByDescending(::pixels)
+            } else {
+                rankSizesForAspect(sizes, ratio)
+            }
+            ranked.take(MAX_SESSION_SIZE_ATTEMPTS_PER_PIPELINE).forEach { size ->
+                result += StillCandidate(pipeline, size)
+            }
+        }
 
         if (requested == PhotoOutputFormat.DNG) {
-            val rawSizes = runCatching { map?.getOutputSizes(ImageFormat.RAW_SENSOR) }
-                .getOrNull()
-                .orEmpty()
-            return if (
+            val rawSizes = allOutputSizes(map, ImageFormat.RAW_SENSOR)
+            if (
                 route.access == CameraRouteAccess.DIRECT_CAMERA_DEVICE &&
                 route.camera.rawSupported &&
                 rawSizes.isNotEmpty()
             ) {
-                listOf(StillPipeline.RAW_DNG, StillPipeline.JPEG)
-            } else {
-                listOf(StillPipeline.JPEG)
+                addCandidates(StillPipeline.RAW_DNG, rawSizes, cropAfterCapture = true)
             }
+            addCandidates(StillPipeline.JPEG, allOutputSizes(map, ImageFormat.JPEG))
+            return result.distinctBy { "${it.pipeline}:${it.size.width}x${it.size.height}" }
         }
 
-        if (requested == PhotoOutputFormat.JPEG) return listOf(StillPipeline.JPEG)
-
-        val nativeHeifSizes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            runCatching { map?.getOutputSizes(ImageFormat.HEIC) }.getOrNull().orEmpty()
-        } else emptyArray()
-        val yuvSizes = runCatching { map?.getOutputSizes(ImageFormat.YUV_420_888) }
-            .getOrNull()
-            .orEmpty()
-
-        val result = mutableListOf<StillPipeline>()
-        val nativeHasRequestedRatio = nativeHeifSizes.any { ratioDifference(it, ratio) < 0.035f }
-        if (nativeHasRequestedRatio) result += StillPipeline.NATIVE_HEIF
-        if (yuvSizes.isNotEmpty() && hasHevcEncoder()) result += StillPipeline.SOFTWARE_HEIF
-        if (nativeHeifSizes.isNotEmpty() && StillPipeline.NATIVE_HEIF !in result) {
-            result += StillPipeline.NATIVE_HEIF
+        if (requested == PhotoOutputFormat.JPEG) {
+            addCandidates(StillPipeline.JPEG, allOutputSizes(map, ImageFormat.JPEG))
+            return result.distinctBy { "${it.pipeline}:${it.size.width}x${it.size.height}" }
         }
-        result += StillPipeline.JPEG
-        return result.distinct()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            addCandidates(StillPipeline.NATIVE_HEIF, allOutputSizes(map, ImageFormat.HEIC))
+        }
+
+        if (hasHevcEncoder()) {
+            val yuvSizes = allOutputSizes(map, ImageFormat.YUV_420_888)
+            val bounded = yuvSizes.filter { pixels(it) <= SOFTWARE_HEIF_MAX_PIXELS }
+                .ifEmpty { yuvSizes.minByOrNull(::pixels)?.let(::listOf).orEmpty() }
+            addCandidates(
+                StillPipeline.SOFTWARE_HEIF,
+                bounded,
+                cropAfterCapture = true,
+            )
+        }
+
+        addCandidates(StillPipeline.JPEG, allOutputSizes(map, ImageFormat.JPEG))
+        return result.distinctBy { "${it.pipeline}:${it.size.width}x${it.size.height}" }
+    }
+
+    private fun allOutputSizes(
+        map: StreamConfigurationMap,
+        format: Int,
+    ): List<Size> {
+        val regular = runCatching { map.getOutputSizes(format) }.getOrNull().orEmpty()
+        val highResolution = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            runCatching { map.getHighResolutionOutputSizes(format) }.getOrNull().orEmpty()
+        } else {
+            emptyArray()
+        }
+        return (regular.asList() + highResolution.asList())
+            .distinctBy { "${it.width}x${it.height}" }
+    }
+
+    private fun rankSizesForAspect(
+        sizes: List<Size>,
+        ratio: PhotoAspectRatio,
+    ): List<Size> {
+        if (sizes.isEmpty()) return emptyList()
+        val matching = sizes
+            .filter { ratioDifference(it, ratio) <= STILL_ASPECT_TOLERANCE }
+            .sortedByDescending(::pixels)
+        val matchingKeys = matching.mapTo(mutableSetOf()) { "${it.width}x${it.height}" }
+        val remaining = sizes
+            .filterNot { "${it.width}x${it.height}" in matchingKeys }
+            .sortedWith(
+                compareBy<Size> { ratioDifference(it, ratio) }
+                    .thenByDescending(::pixels),
+            )
+        return matching + remaining
     }
 
     private fun hasHevcEncoder(): Boolean = runCatching {
@@ -904,45 +1049,38 @@ class Camera2PhotoController(
         }
     }.getOrDefault(false)
 
-    private fun choosePreviewSize(
-        chars: CameraCharacteristics,
-        ratio: PhotoAspectRatio,
-    ): Size {
-        val sizes = chars
-            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?.getOutputSizes(SurfaceTexture::class.java)
-            .orEmpty()
-        if (sizes.isEmpty()) return Size(1280, 960)
-        val maxPixels = 1920L * 1080L
-        val matching = sizes.filter { size ->
-            ratioDifference(size, ratio) < 0.035f && pixels(size) <= maxPixels
-        }
-        return matching.maxByOrNull(::pixels)
-            ?: sizes.filter { pixels(it) <= maxPixels }.minByOrNull { ratioDifference(it, ratio) }
-            ?: sizes.minBy { ratioDifference(it, ratio) }
-    }
-
-    private fun chooseCaptureSize(
-        chars: CameraCharacteristics,
-        ratio: PhotoAspectRatio,
-        format: Int,
-    ): Size {
+    /**
+     * Preview size follows the camera's native processed aspect, not the selected photo crop.
+     * This prevents 1:1/2:1 UI modes from selecting tiny square/wide preview streams.
+     */
+    private fun choosePreviewSize(chars: CameraCharacteristics): Size {
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val sizes = runCatching { map?.getOutputSizes(format) }.getOrNull().orEmpty()
-        if (sizes.isEmpty()) {
-            val fallback = map?.getOutputSizes(ImageFormat.JPEG).orEmpty()
-            if (fallback.isEmpty()) return Size(1920, 1440)
-            val matchingFallback = fallback.filter { ratioDifference(it, ratio) < 0.035f }
-            return (matchingFallback.ifEmpty { fallback.toList() }).maxBy(::pixels)
-        }
-        if (format == ImageFormat.RAW_SENSOR) return sizes.maxBy(::pixels)
+        val sizes = runCatching { map?.getOutputSizes(ImageFormat.PRIVATE) }
+            .getOrNull()
+            .orEmpty()
+            .ifEmpty {
+                runCatching { map?.getOutputSizes(SurfaceTexture::class.java) }
+                    .getOrNull()
+                    .orEmpty()
+            }
+        if (sizes.isEmpty()) return Size(1440, 1080)
 
-        val matching = sizes.filter { ratioDifference(it, ratio) < 0.035f }
-        val pool = matching.ifEmpty { sizes.toList() }
-        val safePool = if (format == ImageFormat.YUV_420_888) {
-            pool.filter { pixels(it) <= SOFTWARE_HEIF_MAX_PIXELS }.ifEmpty { pool }
-        } else pool
-        return safePool.maxBy(::pixels)
+        val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        val sensorAspect = active?.let { it.width().toFloat() / it.height().toFloat() } ?: 4f / 3f
+        val bounded = sizes.filter { size ->
+            pixels(size) <= PREVIEW_MAX_PIXELS &&
+                max(size.width, size.height) <= PREVIEW_MAX_LONG_EDGE
+        }.ifEmpty { sizes.toList() }
+        val nativeAspect = bounded.filter { size ->
+            abs(size.width.toFloat() / size.height.toFloat() - sensorAspect) <= PREVIEW_ASPECT_TOLERANCE
+        }
+        return nativeAspect.maxByOrNull(::pixels)
+            ?: bounded.minWithOrNull(
+                compareBy<Size> {
+                    abs(it.width.toFloat() / it.height.toFloat() - sensorAspect)
+                }.thenByDescending(::pixels),
+            )
+            ?: sizes.first()
     }
 
     private fun ratioDifference(size: Size, ratio: PhotoAspectRatio): Float {
@@ -952,6 +1090,35 @@ class Camera2PhotoController(
     }
 
     private fun pixels(size: Size): Long = size.width.toLong() * size.height.toLong()
+
+    private fun centerCropRect(size: Size, ratio: PhotoAspectRatio): RectF {
+        val sourceWidth = size.width.toFloat()
+        val sourceHeight = size.height.toFloat()
+        val target = ratio.width.toFloat() / ratio.height.toFloat()
+        val source = sourceWidth / sourceHeight
+        return if (source > target) {
+            val width = sourceHeight * target
+            val left = (sourceWidth - width) / 2f
+            RectF(left, 0f, left + width, sourceHeight)
+        } else {
+            val height = sourceWidth / target
+            val top = (sourceHeight - height) / 2f
+            RectF(0f, top, sourceWidth, top + height)
+        }
+    }
+
+    private fun centerCropRect(source: Rect, targetAspect: Float): Rect {
+        val sourceAspect = source.width().toFloat() / source.height().toFloat()
+        return if (sourceAspect > targetAspect) {
+            val width = (source.height() * targetAspect).roundToInt().coerceAtLeast(2)
+            val left = source.left + (source.width() - width) / 2
+            Rect(left, source.top, left + width, source.bottom)
+        } else {
+            val height = (source.width() / targetAspect).roundToInt().coerceAtLeast(2)
+            val top = source.top + (source.height() - height) / 2
+            Rect(source.left, top, source.right, top + height)
+        }
+    }
 
     private fun packYuv420(image: Image): CapturedImage {
         require(image.format == ImageFormat.YUV_420_888) {
@@ -1086,76 +1253,6 @@ class Camera2PhotoController(
         }
     }
 
-    private fun configureTransform(
-        textureView: TextureView,
-        previewSize: Size,
-        chars: CameraCharacteristics,
-    ) {
-        if (textureView.width <= 0 || textureView.height <= 0) return
-        val surfaceRotation = textureView.display?.rotation ?: Surface.ROTATION_0
-        val surfaceRotationDegrees = when (surfaceRotation) {
-            Surface.ROTATION_90 -> 90
-            Surface.ROTATION_180 -> 180
-            Surface.ROTATION_270 -> 270
-            else -> 0
-        }
-        val windowSize = Size(textureView.width, textureView.height)
-        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-        val isRotationRequired = computeRelativeRotation(chars, surfaceRotationDegrees) % 180 != 0
-
-        val scaleX: Float
-        val scaleY: Float
-        if (sensorOrientation == 0) {
-            scaleX = if (!isRotationRequired) {
-                windowSize.width.toFloat() / previewSize.height
-            } else windowSize.width.toFloat() / previewSize.width
-            scaleY = if (!isRotationRequired) {
-                windowSize.height.toFloat() / previewSize.width
-            } else windowSize.height.toFloat() / previewSize.height
-        } else {
-            scaleX = if (isRotationRequired) {
-                windowSize.width.toFloat() / previewSize.height
-            } else windowSize.width.toFloat() / previewSize.width
-            scaleY = if (isRotationRequired) {
-                windowSize.height.toFloat() / previewSize.width
-            } else windowSize.height.toFloat() / previewSize.height
-        }
-
-        if (scaleX == 0f || scaleY == 0f) return
-        val finalScale = max(scaleX, scaleY)
-        val halfWidth = windowSize.width / 2f
-        val halfHeight = windowSize.height / 2f
-        val matrix = Matrix()
-        if (isRotationRequired) {
-            matrix.setScale(
-                1f / scaleX * finalScale,
-                1f / scaleY * finalScale,
-                halfWidth,
-                halfHeight,
-            )
-        } else {
-            matrix.setScale(
-                windowSize.height / windowSize.width.toFloat() / scaleY * finalScale,
-                windowSize.width / windowSize.height.toFloat() / scaleX * finalScale,
-                halfWidth,
-                halfHeight,
-            )
-        }
-        matrix.postRotate(-surfaceRotationDegrees.toFloat(), halfWidth, halfHeight)
-        textureView.setTransform(matrix)
-    }
-
-    private fun computeRelativeRotation(
-        chars: CameraCharacteristics,
-        deviceOrientationDegrees: Int,
-    ): Int {
-        val sensorOrientationDegrees = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-        val sign = if (
-            chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
-        ) 1 else -1
-        return (sensorOrientationDegrees - deviceOrientationDegrees * sign + 360) % 360
-    }
-
     private fun setContinuousAfIfSupported(
         builder: CaptureRequest.Builder,
         chars: CameraCharacteristics,
@@ -1254,44 +1351,17 @@ class Camera2PhotoController(
         }
     }
 
-    private suspend fun awaitSurfaceTexture(textureView: TextureView): SurfaceTexture =
-        suspendCancellableCoroutine { continuation ->
-            textureView.surfaceTexture?.takeIf { textureView.isAvailable }?.let { surface ->
-                continuation.resume(surface)
-                return@suspendCancellableCoroutine
-            }
-            val listener = object : TextureView.SurfaceTextureListener {
-                override fun onSurfaceTextureAvailable(
-                    surface: SurfaceTexture,
-                    width: Int,
-                    height: Int,
-                ) {
-                    textureView.surfaceTextureListener = null
-                    if (continuation.isActive) continuation.resume(surface)
-                }
-
-                override fun onSurfaceTextureSizeChanged(
-                    surface: SurfaceTexture,
-                    width: Int,
-                    height: Int,
-                ) {
-                    activePreviewSize?.let { preview ->
-                        streamCharacteristics?.let { chars ->
-                            configureTransform(textureView, preview, chars)
-                        }
-                    }
-                }
-
-                override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
-                override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
-            }
-            textureView.surfaceTextureListener = listener
-            continuation.invokeOnCancellation {
-                if (textureView.surfaceTextureListener === listener) {
-                    textureView.surfaceTextureListener = null
-                }
-            }
+    private fun resolveRoute(route: ValuableCameraRoute): RouteIds {
+        val physicalId = route.camera.id.takeIf {
+            route.access == CameraRouteAccess.PHYSICAL_VIA_LOGICAL
         }
+        val deviceId = when (route.access) {
+            CameraRouteAccess.DIRECT_CAMERA_DEVICE -> route.camera.id
+            CameraRouteAccess.PHYSICAL_VIA_LOGICAL -> route.logicalCameraIds.firstOrNull()
+                ?: error("Physical camera ${route.camera.id} has no logical parent")
+        }
+        return RouteIds(deviceId, physicalId)
+    }
 
     private fun closeCurrent() {
         runCatching { captureSession?.stopRepeating() }
@@ -1299,7 +1369,7 @@ class Camera2PhotoController(
         runCatching { captureSession?.close() }
         runCatching { cameraDevice?.close() }
         runCatching { imageReader?.close() }
-        runCatching { previewSurface?.release() }
+        // previewSurface belongs to AndroidX Viewfinder and must not be released here.
         captureSession = null
         cameraDevice = null
         imageReader = null
@@ -1308,8 +1378,8 @@ class Camera2PhotoController(
         controlCharacteristics = null
         streamCharacteristics = null
         activeRoute = null
-        activeTextureView = null
         activePreviewSize = null
+        activeCaptureSize = null
         activeStillPipeline = StillPipeline.JPEG
     }
 
@@ -1331,6 +1401,16 @@ class Camera2PhotoController(
         JPEG(ImageFormat.JPEG, PhotoOutputFormat.JPEG),
         RAW_DNG(ImageFormat.RAW_SENSOR, PhotoOutputFormat.DNG),
     }
+
+    private data class StillCandidate(
+        val pipeline: StillPipeline,
+        val size: Size,
+    )
+
+    private data class RouteIds(
+        val deviceId: String,
+        val physicalId: String?,
+    )
 
     private data class CapturedImage(
         val bytes: ByteArray,
@@ -1354,6 +1434,11 @@ class Camera2PhotoController(
     )
 
     private companion object {
-        const val SOFTWARE_HEIF_MAX_PIXELS = 20_000_000L
+        const val PREVIEW_MAX_PIXELS = 3_000_000L
+        const val PREVIEW_MAX_LONG_EDGE = 1920
+        const val PREVIEW_ASPECT_TOLERANCE = 0.035f
+        const val STILL_ASPECT_TOLERANCE = 0.035f
+        const val SOFTWARE_HEIF_MAX_PIXELS = 24_000_000L
+        const val MAX_SESSION_SIZE_ATTEMPTS_PER_PIPELINE = 5
     }
 }
