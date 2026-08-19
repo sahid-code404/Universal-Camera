@@ -1,13 +1,17 @@
 package com.omnicam.feature.camera
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.view.Surface
 import android.view.TextureView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -25,20 +29,18 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -100,7 +102,9 @@ fun UniversalCameraRoute(
     val scope = rememberCoroutineScope()
     val haptics = LocalHapticFeedback.current
     val textureView = remember(context) { TextureView(context) }
-    val preferences by preferencesStore.preferences.collectAsStateWithLifecycle(initialValue = LensPreferences())
+    val preferences by preferencesStore.preferences.collectAsStateWithLifecycle(
+        initialValue = LensPreferences(),
+    )
 
     var permissionsGranted by remember { mutableStateOf(cameraPermissionsGranted(context)) }
     var profile by remember { mutableStateOf<DeviceCameraProfile?>(null) }
@@ -124,33 +128,37 @@ fun UniversalCameraRoute(
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { grants ->
-        permissionsGranted = requiredCameraPermissions().all { permission -> grants[permission] == true ||
-            ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED }
+        permissionsGranted = requiredCameraPermissions().all { permission ->
+            grants[permission] == true ||
+                ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
     LaunchedEffect(Unit) {
-        if (!permissionsGranted) permissionLauncher.launch(requiredCameraPermissions())
+        if (!permissionsGranted) {
+            permissionLauncher.launch(requiredCameraPermissions())
+        }
     }
 
     LaunchedEffect(permissionsGranted) {
         if (!permissionsGranted) return@LaunchedEffect
+        scanError = null
         runCatching { scanner.scan() }
             .onSuccess { profile = it }
             .onFailure { scanError = it.message ?: it::class.java.simpleName }
     }
 
     val resolution = remember(profile) { profile?.let(ValuableCameraResolver::resolve) }
-    val allRoutes = remember(resolution, preferences) {
-        resolution?.valuableRoutes.orEmpty()
-    }
+    val allRoutes = resolution?.valuableRoutes.orEmpty()
     val facingRoutes = remember(allRoutes, preferences, selectedFacing) {
-        val raw = allRoutes.filter { it.camera.lensFacing == selectedFacing }
-        preferences.applyOrder(raw, selectedFacing).filter { preferences.isEnabled(it.camera.id) }
+        preferences
+            .applyOrder(allRoutes.filter { it.camera.lensFacing == selectedFacing }, selectedFacing)
+            .filter { preferences.isEnabled(it.camera.id) }
     }
 
     LaunchedEffect(facingRoutes, selectedFacing) {
-        val ids = facingRoutes.mapTo(mutableSetOf()) { it.camera.id }
-        if (selectedCameraId !in ids) {
+        val visibleIds = facingRoutes.mapTo(mutableSetOf()) { it.camera.id }
+        if (selectedCameraId !in visibleIds) {
             selectedCameraId = chooseDefaultRoute(facingRoutes)?.camera?.id
         }
     }
@@ -163,35 +171,51 @@ fun UniversalCameraRoute(
             bindResult = null
             return@LaunchedEffect
         }
+
         zoomRatio = 1f
         exposureComp = 0f
         controller.setFlashMode(flashMode)
         bindResult = controller.bind(textureView, route, aspectRatio)
-        val success = bindResult as? com.omnicam.camera.camerax.CameraBindResult.Success
+        val success = bindResult as? CameraBindResult.Success
         if (success != null) {
             minZoom = success.minZoomRatio
             maxZoom = success.maxZoomRatio
             zoomRatio = 1f.coerceIn(minZoom, maxZoom)
+            controller.setZoomRatio(zoomRatio)
         }
     }
 
-    LaunchedEffect(flashMode) { controller.setFlashMode(flashMode) }
+    LaunchedEffect(flashMode) {
+        controller.setFlashMode(flashMode)
+    }
 
     LaunchedEffect(focusPoint) {
         if (focusPoint != null) {
-            delay(1_200)
+            delay(1_100)
             focusPoint = null
         }
     }
 
-    DisposableEffect(Unit) { onDispose { controller.unbind() } }
+    DisposableEffect(Unit) {
+        onDispose { controller.unbind() }
+    }
 
     Surface(modifier = modifier.fillMaxSize(), color = Color.Black) {
         when {
-            !permissionsGranted -> CameraPermissionScreen(onGrant = { permissionLauncher.launch(requiredCameraPermissions()) })
+            !permissionsGranted -> CameraPermissionScreen(
+                onGrant = { permissionLauncher.launch(requiredCameraPermissions()) },
+            )
+
             scanError != null -> CameraErrorScreen(scanError.orEmpty())
-            profile == null || resolution == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-          else -> CameraContent(
+
+            profile == null || resolution == null -> Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator()
+            }
+
+            else -> CameraContent(
                 textureView = textureView,
                 selectedRoute = selectedRoute,
                 routes = facingRoutes,
@@ -209,7 +233,9 @@ fun UniversalCameraRoute(
                 latestPhotoUri = latestPhotoUri,
                 onTapFocus = { point, width, height ->
                     focusPoint = point
-                    if (width > 0f && height > 0f) controller.focusAt(point.x / width, point.y / height)
+                    if (width > 0f && height > 0f) {
+                        controller.focusAt(point.x / width, point.y / height)
+                    }
                 },
                 onZoom = { requested ->
                     val next = requested.coerceIn(minZoom, maxZoom)
@@ -220,26 +246,37 @@ fun UniversalCameraRoute(
                     exposureComp = requested
                     controller.setExposureCompensation(requested.roundToInt())
                 },
-                onFlash = { flashMode = nextFlashMode(flashMode, selectedRoute?.camera?.flashAvailable == true) },
+                onFlash = {
+                    flashMode = nextFlashMode(
+                        current = flashMode,
+                        supported = selectedRoute?.camera?.flashAvailable == true,
+                    )
+                },
                 onAspectRatio = {
-                    aspectRatio = if (aspectRatio == PhotoAspectRatio.FOUR_THREE) PhotoAspectRatio.SIXTEEN_NINE else PhotoAspectRatio.FOUR_THREE
+                    aspectRatio = if (aspectRatio == PhotoAspectRatio.FOUR_THREE) {
+                        PhotoAspectRatio.SIXTEEN_NINE
+                    } else {
+                        PhotoAspectRatio.FOUR_THREE
+                    }
                 },
                 onSettings = { showSettings = true },
                 onSelectLens = { selectedCameraId = it },
                 onFlip = {
                     val target = if (selectedFacing == LensFacing.BACK) LensFacing.FRONT else LensFacing.BACK
-                    if (allRoutes.any { it.camera.lensFacing == target }) {
+                    if (allRoutes.any { it.camera.lensFacing == target && preferences.isEnabled(it.camera.id) }) {
                         selectedFacing = target
+                        selectedCameraId = null
                         flashMode = CameraFlashMode.OFF
                     }
                 },
                 onCapture = {
                     if (!capturing && bindResult is CameraBindResult.Success) {
                         capturing = true
-                        haptics.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                        haptics.performHapticFeedback(
+                            androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress,
+                        )
                         scope.launch {
-                            val rotationDegrees = displayRotationDegrees(textureView)
-                            captureResult = controller.capturePhoto(rotationDegrees)
+                            captureResult = controller.capturePhoto(displayRotationDegrees(textureView))
                             val success = captureResult as? PhotoCaptureResult.Success
                             if (success != null) latestPhotoUri = success.uri
                             capturing = false
@@ -269,9 +306,14 @@ fun UniversalCameraRoute(
             routes = resolution.valuableRoutes,
             preferences = preferences,
             onDismiss = { showLensManager = false },
-            onToggle = { cameraId, enabled -> scope.launch { preferencesStore.setEnabled(cameraId, enabled) } },
+            onToggle = { cameraId, enabled ->
+                scope.launch { preferencesStore.setEnabled(cameraId, enabled) }
+            },
             onMove = { facing, cameraId, delta ->
-                val faceRoutes = preferences.applyOrder(resolution.valuableRoutes.filter { it.camera.lensFacing == facing }, facing)
+                val faceRoutes = preferences.applyOrder(
+                    resolution.valuableRoutes.filter { it.camera.lensFacing == facing },
+                    facing,
+                )
                 val ids = faceRoutes.map { it.camera.id }.toMutableList()
                 val from = ids.indexOf(cameraId)
                 val to = (from + delta).coerceIn(0, ids.lastIndex)
@@ -313,7 +355,6 @@ private fun CameraContent(
     onFlip: () -> Unit,
     onCapture: () -> Unit,
 ) {
-    val context = LocalContext.current
     val mainEq = chooseDefaultRoute(routes)?.camera?.equivalentFocalLengthsMm?.minOrNull()
     val exposureRange = selectedRoute?.camera?.aeCompensationRange ?: 0..0
 
@@ -322,27 +363,40 @@ private fun CameraContent(
             factory = { textureView },
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(selectedRoute?.camera?.id) {
+                .pointerInput(selectedRoute?.camera?.id, zoomRatio) {
                     detectTransformGestures { _, _, gestureZoom, _ ->
                         if (gestureZoom != 1f) onZoom(zoomRatio * gestureZoom)
                     }
                 }
                 .pointerInput(selectedRoute?.camera?.id) {
-                    detectTapGestures { offset -> onTapFocus(offset, size.width.toFloat(), size.height.toFloat()) }
+                    detectTapGestures { offset ->
+                        onTapFocus(offset, size.width.toFloat(), size.height.toFloat())
+                    }
                 },
         )
 
         Box(
-            Modifier.fillMaxWidth().height(130.dp).align(Alignment.TopCenter).background(Color.Black.copy(alpha = 0.30f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(126.dp)
+                .align(Alignment.TopCenter)
+                .background(Color.Black.copy(alpha = 0.32f)),
         )
 
         Row(
-            modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter).padding(top = 42.dp, start = 18.dp, end = 18.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .padding(top = 42.dp, start = 14.dp, end = 14.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
             CameraTextControl(
-                text = if (selectedRoute?.camera?.flashAvailable == true) flashLabel(flashMode) else "Flash â€”",
+                text = if (selectedRoute?.camera?.flashAvailable == true) {
+                    flashLabel(flashMode)
+                } else {
+                    "Flash --"
+                },
                 enabled = selectedRoute?.camera?.flashAvailable == true,
                 onClick = onFlash,
             )
@@ -350,32 +404,56 @@ private fun CameraContent(
                 text = if (aspectRatio == PhotoAspectRatio.FOUR_THREE) "4:3" else "16:9",
                 onClick = onAspectRatio,
             )
-            CameraTextControl(text = "âš™", onClick = onSettings)
+            CameraTextControl(text = "Settings", onClick = onSettings)
         }
 
         bindStatusText(bindResult)?.let { status ->
             Surface(
-                modifier = Modifier.align(Alignment.TopCenter).padding(top = 90.dp),
-                shape = RoundedCornerShape(20.dp),
-                color = Color.Black.copy(alpha = 0.55f),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 88.dp),
+                shape = RoundedCornerShape(18.dp),
+                color = Color.Black.copy(alpha = 0.58f),
             ) {
-                Text(status, Modifier.padding(horizontal = 12.dp, vertical = 6.dp), color = Color.White, style = MaterialTheme.typography.labelSmall)
+                Text(
+                    text = status,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                )
             }
         }
 
         focusPoint?.let { point ->
-            Box(
-                modifier = Modifier.offset { IntOffset((point.x - 30).roundToInt(), (point.y - 30).roundToInt()) }.size(60.dp),
-                contentAlignment = Alignment.Center,
-            ) { Text("â–¢", color = Color.White, style = MaterialTheme.typography.headlineLarge) }
+            Surface(
+                modifier = Modifier
+                    .offset {
+                        IntOffset(
+                            x = (point.x - 28).roundToInt(),
+                            y = (point.y - 28).roundToInt(),
+                        )
+                    }
+                    .size(56.dp),
+                shape = RoundedCornerShape(8.dp),
+                color = Color.Transparent,
+                border = BorderStroke(2.dp, Color.White),
+            ) {}
         }
 
         if (exposureRange.first != exposureRange.last) {
             Column(
-                modifier = Modifier.align(Alignment.CenterEnd).padding(end = 8.dp).background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(18.dp)).padding(horizontal = 8.dp, vertical = 6.dp),
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 8.dp)
+                    .background(Color.Black.copy(alpha = 0.38f), RoundedCornerShape(18.dp))
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Text("EV ${exposureComp.roundToInt()}", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                Text(
+                    text = "EV ${exposureComp.roundToInt()}",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                )
                 Slider(
                     value = exposureComp,
                     onValueChange = onExposure,
@@ -387,7 +465,11 @@ private fun CameraContent(
         }
 
         Column(
-            modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter).background(Color.Black.copy(alpha = 0.82f)).padding(top = 10.dp, bottom = 24.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.BottomCenter)
+                .background(Color.Black.copy(alpha = 0.84f))
+                .padding(top = 10.dp, bottom = 22.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             if (routes.isNotEmpty()) {
@@ -401,203 +483,428 @@ private fun CameraContent(
                             text = lensLabel(route, mainEq),
                             selected = route.camera.id == selectedRoute?.camera?.id,
                             onClick = { onSelectLens(route.camera.id) },
-                         )
+                        )
                     }
                 }
             }
 
             Text(
-                if (zoomRatio > 1.02f) String.format(Locale.US, "%.1fÃ—È‹›ÛÛT˜][ÊH[ÙH”ÕÈ‹ˆÛÛÜˆHÛÛÜ‹•Ú]K˜ÛÜJ[HH™ŠKˆİ[HHX]\šX[[YK\ÙÜ˜\K›X™[\™ÙKˆ[ÙYšY\ˆH[ÙYšY\‹œY[™Ê™\XØ[H™
-Kˆ
-B‚ˆ›İÊˆ[ÙYšY\ˆH[ÙYšY\‹™š[X^ÚY
+                text = if (zoomRatio > 1.02f) {
+                    String.format(Locale.US, "%.1fx", zoomRatio)
+                } else {
+                    "PHOTO"
+                },
+                color = Color.White.copy(alpha = 0.82f),
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.padding(vertical = 7.dp),
+            )
 
-KœY[™ÊÜš^›Û[H™
-KˆÜš^›Û[\œ˜[™Ù[Y[H\œ˜[™Ù[Y[”ÜXÙP™]ÙY[‹ˆ™\XØ[[YÛ›Y[H[YÛ›Y[Ù[\•™\XØ[Kˆ
-HÂˆ]\İİÕ[X›˜Z[
-]\İİÕ\šJB‚ˆİ\™˜XÙJˆ[ÙYšY\ˆH[ÙYšY\‹œÚ^™JÎ™
-KˆÚ\HHÚ\˜ÛTÚ\KˆÛÛÜˆHÛÛÜ‹•Ú]KˆÛÛXÚÈHÛØ\\™Kˆ[˜X›YHXØ\\š[™È	‰ˆš[™™\İ[\ÈØ[Y\˜Pš[™™\İ[”İXØÙ\ÜËˆ
-HÂˆ›Ş
-ÛÛ[[YÛ›Y[H[YÛ›Y[Ù[\ŠHÂˆYˆ
-Ø\\š[™ÊHÚ\˜İ[\”›ÙÜ™\ÜÒ[™XØ]ÜŠ[ÙYšY\ˆH[ÙYšY\‹œÚ^™JÌ™
-KÛÛÜˆHÛÛÜ‹›XÚÊBˆ[ÙHİ\™˜XÙJ[ÙYšY\ˆH[ÙYšY\‹œÚ^™JŒ‹™
-KÚ\HHÚ\˜ÛTÚ\KÛÛÜˆHÛÛÜ‹•Ú]K›Ü™\ˆH[™›ÚY˜ÛÛ\ÜÙK™›İ[™][Û‹›Ü™\”İ›ÚÙJ‹™ÛÛÜ‹›XÚÊJHßBˆBˆB‚ˆİ\™˜XÙJˆ[ÙYšY\ˆH[ÙYšY\‹œÚ^™JL™
-KˆÚ\HHÚ\˜ÛTÚ\KˆÛÛÜˆHÛÛÜ‹›XÚË˜ÛÜJ[HHYŠKˆÛÛXÚÈHÛ‘›\ˆ
-HÂˆ›Ş
-ÛÛ[[YÛ›Y[H[YÛ›Y[Ù[\ŠHÂˆ^
-Yˆ
-Ù[XİY˜XÚ[™ÈOH[œÑ˜XÚ[™ËPÒÊH¸¡®Èˆ[ÙH¸¡¦È‹ÛÛÜˆHÛÛÜ‹•Ú]Kİ[HHX]\šX[[YK\ÙÜ˜\KšXY[™TÛX[
-BˆBˆBˆB‚ˆÚ[ˆ
-Ø\\™T™\İ[
-HÂˆ\ÈİĞØ\\™T™\İ[‘˜Z[\™HOˆ^
-ˆØ\\™T™\İ[›Y\ÜØYÙKˆÛÛÜˆHX]\šX[[YK˜ÛÛÜ”ØÚ[YK™\œ›Ü‹ˆİ[HHX]\šX[[YK\ÙÜ˜\K˜›ÙTÛX[ˆ[ÙYšY\ˆH[ÙYšY\‹œY[™ÊÜH‹™İ\HM‹™[™HM‹™
-Kˆ
-Bˆ[ÙHOˆ[š]ˆBˆBˆBŸB‚ÛÛ\ÜØX›Bœš]˜]H[ˆ]\İİÕ[X›˜Z[
-\šNˆ\šOÊHÂˆ˜[ÛÛ^HØØ[ÛÛ^˜İ\œ™[ˆ˜\ˆš]X\H™[Y[X™\Š\šJHÈ]]X›Tİ]SÙ[™›ÚY™Ü˜\XÜËš]X\ÏŠ[
-HBˆ][˜ÚYY™™Xİ
-\šJHÂˆš]X\Ëœ™XŞXÛJ
-Bˆš]X\HYˆ
-\šHOH[
-H[[ÙHÚ]ÛÛ^
-\Ü]Ú\œË’SÊHÂˆ[Ø]Ú[™ÈÂˆÛÛ^˜ÛÛ[™\ÛÛ™\‹›Ü[’[œ]İ™X[J\šJOË\ÙHÈ[œ]O‚ˆ[™›ÚY™Ü˜\XÜËš]X\˜XİÜK™XÛÙTİ™X[J[œ]
-BˆBˆK™Ù]Ü“[
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 28.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                LatestPhotoThumbnail(latestPhotoUri)
 
-BˆBˆBˆİ\™˜XÙJ[ÙYšY\ˆH[ÙYšY\‹œÚ^™JL™
-KÚ\HH›İ[™YÛÜ›™\”Ú\JL‹™
-KÛÛÜˆHÛÛÜ‹‘\šÑÜ˜^JHÂˆ˜[İ\œ™[Hš]X\ˆYˆ
-İ\œ™[OH[
-HÂˆ[XYÙJˆš]X\Hİ\œ™[˜\Ò[XYÙPš]X\
+                Surface(
+                    modifier = Modifier.size(78.dp),
+                    shape = CircleShape,
+                    color = Color.White,
+                    border = BorderStroke(2.dp, Color.LightGray),
+                    enabled = !capturing && bindResult is CameraBindResult.Success,
+                    onClick = onCapture,
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        if (capturing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(30.dp),
+                                color = Color.Black,
+                            )
+                        } else {
+                            Surface(
+                                modifier = Modifier.size(62.dp),
+                                shape = CircleShape,
+                                color = Color.White,
+                                border = BorderStroke(2.dp, Color.Black),
+                            ) {}
+                        }
+                    }
+                }
 
-KˆÛÛ[\ØÜš\[ÛˆH“]\İÛ[šPØ[HİÈ‹ˆÛÛ[ØØ[HHÛÛ[ØØ[KÜ›Üˆ[ÙYšY\ˆH[ÙYšY\‹™š[X^Ú^™J
-Kˆ
-BˆH[ÙHÂˆ›Ş
-ÛÛ[[YÛ›Y[H[YÛ›Y[Ù[\ŠHÈ^
-¸¥©È‹ÛÛÜˆHÛÛÜ‹•Ú]JHBˆBˆBŸB‚ÛÛ\ÜØX›Bœš]˜]H[ˆ[œÔ[
-^ˆİš[™ËÙ[XİYˆ›ÛÛX[‹ÛÛXÚÎˆ
+                Surface(
+                    modifier = Modifier.size(50.dp),
+                    shape = CircleShape,
+                    color = Color.Black.copy(alpha = 0.68f),
+                    border = BorderStroke(1.dp, Color.DarkGray),
+                    onClick = onFlip,
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(
+                            text = if (selectedFacing == LensFacing.BACK) "Front" else "Rear",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                }
+            }
 
-HOˆ[š]
-HÂˆYˆ
-Ù[XİY
-HÂˆ]ÛŠÛÛXÚÈHÛÛXÚËÚ\HHÚ\˜ÛTÚ\KÛÛ[Y[™ÈHY[™Õ˜[Y\ÊÜš^›Û[HM™™\XØ[H™
-JHÂˆ^
-^›ÛÙZYÚH›ÛÙZYÚ›Û
-BˆBˆH[ÙHÂˆ^]ÛŠÛÛXÚÈHÛÛXÚÊHÈ^
-^ÛÛÜˆHÛÛÜ‹•Ú]JHBˆBŸB‚ÛÛ\ÜØX›Bœš]˜]H[ˆØ[Y\˜U^ÛÛ›Û
-^ˆİš[™Ë[˜X›Yˆ›ÛÛX[ˆHYKÛÛXÚÎˆ
+            when (captureResult) {
+                is PhotoCaptureResult.Failure -> Text(
+                    text = captureResult.message,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 6.dp, start = 16.dp, end = 16.dp),
+                )
+                else -> Unit
+            }
 
-HOˆ[š]
-HÂˆ^]ÛŠÛÛXÚÈHÛÛXÚË[˜X›YH[˜X›Y
-HÂˆ^
-^ÛÛÜˆHYˆ
-[˜X›Y
-HÛÛÜ‹•Ú]H[ÙHÛÛÜ‹•Ú]K˜ÛÜJ[HHYŠK›ÛÙZYÚH›ÛÙZYÚ”Ù[ZP›Û
-BˆBŸB‚Ü[Š^\š[Y[[X]\šX[Ğ\N˜Û\ÜÊBÛÛ\ÜØX›Bœš]˜]H[ˆØ[Y\˜TÙ][™ÜÔÚY]
-ˆÛ‘\ÛZ\ÜÎˆ
+            if (maxZoom > minZoom + 0.01f) {
+                Slider(
+                    value = zoomRatio.coerceIn(minZoom, maxZoom),
+                    onValueChange = onZoom,
+                    valueRange = minZoom..maxZoom,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 40.dp),
+                )
+            }
+        }
+    }
+}
 
-HOˆ[š]ˆÛ“X[˜YÙS[œÙ\Îˆ
+@Composable
+private fun LatestPhotoThumbnail(uri: Uri?) {
+    val context = LocalContext.current
+    var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
 
-HOˆ[š]ˆÛ‘XYÛ›ÜİXÜÎˆ
+    LaunchedEffect(uri) {
+        bitmap = if (uri == null) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openInputStream(uri)?.use(BitmapFactory::decodeStream)
+                }.getOrNull()
+            }
+        }
+    }
 
-HOˆ[š]ŠHÂˆ[Ù[›İÛTÚY]
-Û‘\ÛZ\ÜÔ™\]Y\İHÛ‘\ÛZ\ÜÊHÂˆÛÛ[[Š[ÙYšY\‹™š[X^ÚY
+    Surface(
+        modifier = Modifier.size(50.dp),
+        shape = RoundedCornerShape(12.dp),
+        color = Color.DarkGray,
+    ) {
+        val current = bitmap
+        if (current != null) {
+            Image(
+                bitmap = current.asImageBitmap(),
+                contentDescription = "Latest OmniCam photo",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
+        } else {
+            Box(contentAlignment = Alignment.Center) {
+                Text("Gallery", color = Color.White, style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
 
-KœY[™ÊÜš^›Û[HŒ™™\XØ[H™
-JHÂˆ^
-Ø[Y\˜HÙ][™ÜÈ‹İ[HHX]\šX[[YK\ÙÜ˜\KšXY[™TÛX[›ÛÙZYÚH›ÛÙZYÚ›Û
-BˆÜXÙ\Š[ÙYšY\‹šZYÚ
-M‹™
-JBˆ]ÛŠÛÛXÚÈHÛ“X[˜YÙS[œÙ\Ë[ÙYšY\ˆH[ÙYšY\‹™š[X^ÚY
+@Composable
+private fun LensPill(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    if (selected) {
+        Button(
+            onClick = onClick,
+            shape = CircleShape,
+            contentPadding = PaddingValues(horizontal = 15.dp, vertical = 8.dp),
+        ) {
+            Text(text, fontWeight = FontWeight.Bold)
+        }
+    } else {
+        TextButton(onClick = onClick) {
+            Text(text, color = Color.White)
+        }
+    }
+}
 
-JHÈ^
-“X[˜YÙH[œÙ\ÈŠHBˆÜXÙ\Š[ÙYšY\‹šZYÚ
-™
-JBˆİ][™Y]ÛŠÛÛXÚÈHÛ‘XYÛ›ÜİXÜË[ÙYšY\ˆH[ÙYšY\‹™š[X^ÚY
+@Composable
+private fun CameraTextControl(
+    text: String,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
+    TextButton(onClick = onClick, enabled = enabled) {
+        Text(
+            text = text,
+            color = if (enabled) Color.White else Color.White.copy(alpha = 0.4f),
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
 
-JHÈ^
-Ø[Y\˜HXYÛ›ÜİXÜÈŠHBˆÜXÙ\Š[ÙYšY\‹šZYÚ
-™
-JBˆBˆBŸB‚Ü[Š^\š[Y[[X]\šX[Ğ\N˜Û\ÜÊBÛÛ\ÜØX›Bœš]˜]H[ˆØ[Y\˜S[œÓX[˜YÙ\”ÚY]
-ˆ›İ]\Îˆ\İ˜[XX›PØ[Y\˜T›İ]O‹ˆ™Y™\™[˜Ù\Îˆ[œÔ™Y™\™[˜Ù\ËˆÛ‘\ÛZ\ÜÎˆ
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CameraSettingsSheet(
+    onDismiss: () -> Unit,
+    onManageLenses: () -> Unit,
+    onDiagnostics: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+        ) {
+            Text(
+                text = "Camera settings",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = onManageLenses,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Manage lenses")
+            }
+            Spacer(Modifier.height(8.dp))
+            TextButton(
+                onClick = onDiagnostics,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Camera diagnostics")
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
 
-HOˆ[š]ˆÛ•ÙÙÛNˆ
-İš[™Ë›ÛÛX[ŠHOˆ[š]ˆÛ“[İ™Nˆ
-[œÑ˜XÚ[™Ëİš[™Ë[
-HOˆ[š]ˆÛ”™\Ù]ˆ
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CameraLensManagerSheet(
+    routes: List<ValuableCameraRoute>,
+    preferences: LensPreferences,
+    onDismiss: () -> Unit,
+    onToggle: (String, Boolean) -> Unit,
+    onMove: (LensFacing, String, Int) -> Unit,
+    onReset: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp),
+        ) {
+            Text(
+                text = "Lens layout",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = "Enable only the useful lenses you want and choose their order.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
 
-HOˆ[š]ŠHÂˆ[Ù[›İÛTÚY]
-Û‘\ÛZ\ÜÔ™\]Y\İHÛ‘\ÛZ\ÜÊHÂˆÛÛ[[Š[ÙYšY\‹™š[X^ÚY
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(420.dp),
+            ) {
+                listOf(LensFacing.BACK, LensFacing.FRONT).forEach { facing ->
+                    val faceRoutes = preferences.applyOrder(
+                        routes.filter { it.camera.lensFacing == facing },
+                        facing,
+                    )
+                    if (faceRoutes.isNotEmpty()) {
+                        item(key = "header-$facing") {
+                            Text(
+                                text = if (facing == LensFacing.BACK) "Rear cameras" else "Front cameras",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(vertical = 8.dp),
+                            )
+                        }
+                        items(faceRoutes, key = { "$facing-${it.camera.id}" }) { route ->
+                            val index = faceRoutes.indexOfFirst { it.camera.id == route.camera.id }
+                            val enabled = preferences.isEnabled(route.camera.id)
+                            val enabledCount = faceRoutes.count { preferences.isEnabled(it.camera.id) }
 
-KœY[™ÊÜš^›Û[HŒ™
-JHÂˆ^
-“[œÈ^[İ]‹İ[HHX]\šX[[YK\ÙÜ˜\KšXY[™TÛX[›ÛÙZYÚH›ÛÙZYÚ›Û
-Bˆ^
-ˆ‘[˜X›HÛ›HH[œÙ\È[İHØ[[™ÚÛÜÙHZ\ˆÜ™\‹ˆÙÚXØ[Ù\XØ]H™[™Üˆ›İ]\Èİ^HY[‹ˆ‹ˆİ[HHX]\šX[[YK\ÙÜ˜\K˜›ÙTÛX[ˆÛÛÜˆHX]\šX[[YK˜ÛÛÜ”ØÚ[YK›Û”İ\™˜XÙU˜\šX[ˆ
-BˆÜXÙ\Š[ÙYšY\‹šZYÚ
-L‹™
-JBˆ^PÛÛ[[Š[ÙYšY\‹™š[X^ÚY
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = lensManagerTitle(route),
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        text = lensManagerSubtitle(route),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                TextButton(
+                                    enabled = index > 0,
+                                    onClick = { onMove(facing, route.camera.id, -1) },
+                                ) { Text("Up") }
+                                TextButton(
+                                    enabled = index < faceRoutes.lastIndex,
+                                    onClick = { onMove(facing, route.camera.id, 1) },
+                                ) { Text("Down") }
+                                Switch(
+                                    checked = enabled,
+                                    enabled = !(enabled && enabledCount <= 1),
+                                    onCheckedChange = { onToggle(route.camera.id, it) },
+                                )
+                            }
+                            HorizontalDivider()
+                        }
+                    }
+                }
+            }
 
-JHÂˆ\İÙŠ[œÑ˜XÚ[™ËPÒË[œÑ˜XÚ[™Ë‘”“Ó•
-K™›Ü‘XXÚÈ˜XÚ[™ÈO‚ˆ˜[˜XÙT›İ]\ÈH™Y™\™[˜Ù\Ë˜\SÜ™\Š›İ]\Ë™š[\ˆÈ]˜Ø[Y\˜K›[œÑ˜XÚ[™ÈOH˜XÚ[™ÈK˜XÚ[™ÊBˆYˆ
-˜XÙT›İ]\Ëš\Ó›İ[\J
-JHÂˆ][JÙ^HHšXY\‹I˜XÚ[™ÈŠHÂˆ^
-ˆYˆ
-˜XÚ[™ÈOH[œÑ˜XÚ[™ËPÒÊH”™X\ˆØ[Y\˜\Èˆ[ÙH‘œ›ÛØ[Y\˜\È‹ˆİ[HHX]\šX[[YK\ÙÜ˜\K]SYY][Kˆ›ÛÙZYÚH›ÛÙZYÚ›Ûˆ[ÙYšY\ˆH[ÙYšY\‹œY[™Ê™\XØ[H™
-Kˆ
-BˆBˆ][\Ê˜XÙT›İ]\ËÙ^HHÈ‰Ù˜XÚ[™ßKIÚ]˜Ø[Y\˜KšYHˆJHÈ›İ]HO‚ˆ˜[[™^H˜XÙT›İ]\Ëš[™^Ù‘š\œİÈ]˜Ø[Y\˜KšYOH›İ]K˜Ø[Y\˜KšYBˆ˜[[˜X›YH™Y™\™[˜Ù\Ëš\Ñ[˜X›Y
-›İ]K˜Ø[Y\˜KšY
-Bˆ˜[[˜X›YÛİ[H˜XÙT›İ]\Ë˜Ûİ[È™Y™\™[˜Ù\Ëš\Ñ[˜X›Y
-]˜Ø[Y\˜KšY
-HBˆ›İÊˆ[ÙYšY\ˆH[ÙYšY\‹™š[X^ÚY
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onReset) { Text("Reset") }
+                Button(onClick = onDismiss) { Text("Done") }
+            }
+        }
+    }
+}
 
-KœY[™Ê™\XØ[HË™
-Kˆ™\XØ[[YÛ›Y[H[YÛ›Y[Ù[\•™\XØ[Kˆ
-HÂˆÛÛ[[Š[ÙYšY\‹ÙZYÚ
-YŠJHÂˆ^
-[œÓX[˜YÙ\•]J›İ]JK›ÛÙZYÚH›ÛÙZYÚ”Ù[ZP›Û
-Bˆ^
-[œÓX[˜YÙ\”İX]J›İ]JKİ[HHX]\šX[[YK\ÙÜ˜\K˜›ÙTÛX[ÛÛÜˆHX]\šX[[YK˜ÛÛÜ”ØÚ[YK›Û”İ\™˜XÙU˜\šX[
-BˆBˆ^]ÛŠ[˜X›YH[™^ˆÛÛXÚÈHÈÛ“[İ™J˜XÚ[™Ë›İ]K˜Ø[Y\˜KšYLJHJHÈ^
-¸¡¤HŠHBˆ^]ÛŠ[˜X›YH[™^˜XÙT›İ]\Ë›\İ[™^ÛÛXÚÈHÈÛ“[İ™J˜XÚ[™Ë›İ]K˜Ø[Y\˜KšYJHJHÈ^
-¸¡¤ÈŠHBˆİÚ]Ú
-ˆÚXÚÙYH[˜X›Yˆ[˜X›YHJ[˜X›Y	‰ˆ[˜X›YÛİ[HJKˆÛÚXÚÙYÚ[™ÙHHÈÛ•ÙÙÛJ›İ]K˜Ø[Y\˜KšY]
-HKˆ
-BˆBˆÜš^›Û[]šY\Š
-BˆBˆBˆBˆBˆ›İÊ[ÙYšY\‹™š[X^ÚY
+@Composable
+private fun CameraPermissionScreen(onGrant: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(28.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = "OmniCam",
+            style = MaterialTheme.typography.displaySmall,
+            fontWeight = FontWeight.Bold,
+        )
+        Spacer(Modifier.height(10.dp))
+        Text("Camera permission is required for the live viewfinder and photo capture.")
+        Spacer(Modifier.height(20.dp))
+        Button(onClick = onGrant) { Text("Allow camera") }
+    }
+}
 
-KœY[™Ê™\XØ[HM‹™
-KÜš^›Û[\œ˜[™Ù[Y[H\œ˜[™Ù[Y[”ÜXÙP™]ÙY[ŠHÂˆ^]ÛŠÛÛXÚÈHÛ”™\Ù]
-HÈ^
-”™\Ù]ŠHBˆ]ÛŠÛÛXÚÈHÛ‘\ÛZ\ÜÊHÈ^
-‘Û™HŠHBˆBˆBˆBŸB‚ÛÛ\ÜØX›Bœš]˜]H[ˆØ[Y\˜T\›Z\ÜÚ[Û”ØÜ™Y[ŠÛ‘Ü˜[ˆ
+@Composable
+private fun CameraErrorScreen(message: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(28.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = "Camera unavailable",
+            style = MaterialTheme.typography.headlineMedium,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(message)
+    }
+}
 
-HOˆ[š]
-HÂˆÛÛ[[Šˆ[ÙYšY\‹™š[X^Ú^™J
-KœY[™Ê™
-Kˆ™\XØ[\œ˜[™Ù[Y[H\œ˜[™Ù[Y[Ù[\‹ˆÜš^›Û[[YÛ›Y[H[YÛ›Y[Ù[\’Üš^›Û[Kˆ
-HÂˆ^
-“Û[šPØ[H‹İ[HHX]\šX[[YK\ÙÜ˜\K™\Ü^TÛX[›ÛÙZYÚH›ÛÙZYÚ›Û
-BˆÜXÙ\Š[ÙYšY\‹šZYÚ
-L™
-JBˆ^
-Ø[Y\˜HXØÙ\ÜÈ\È™\]Z\™YÈÚİÈH]™HšY]Ùš[™\ˆ[™Ø\\™HİÜËˆŠBˆÜXÙ\Š[ÙYšY\‹šZYÚ
-Œ™
-JBˆ]ÛŠÛÛXÚÈHÛ‘Ü˜[
-HÈ^
-[İÈØ[Y\˜HŠHBˆBŸB‚ÛÛ\ÜØX›Bœš]˜]H[ˆØ[Y\˜Q\œ›Ü”ØÜ™Y[ŠY\ÜØYÙNˆİš[™ÊHÂˆÛÛ[[Šˆ[ÙYšY\‹™š[X^Ú^™J
-KœY[™Ê™
-Kˆ™\XØ[\œ˜[™Ù[Y[H\œ˜[™Ù[Y[Ù[\‹ˆÜš^›Û[[YÛ›Y[H[YÛ›Y[Ù[\’Üš^›Û[Kˆ
-HÂˆ^
-Ø[Y\˜H[˜]˜Z[X›H‹İ[HHX]\šX[[YK\ÙÜ˜\KšXY[™SYY][JBˆÜXÙ\Š[ÙYšY\‹šZYÚ
-™
-JBˆ^
-Y\ÜØYÙJBˆBŸB‚œš]˜]H[ˆ™\]Z\™YØ[Y\˜T\›Z\ÜÚ[ÛœÊ
-Nˆ\œ˜^Oİš[™ÏˆHZ[\İÂˆY
-X[šY™\İœ\›Z\ÜÚ[Û‹ĞSQTJBˆYˆ
-Z[•‘T”ÒSÓ‹”Ñ×ÒS•OHZ[•‘T”ÒSÓ—ĞÓÑTË”
-HY
-X[šY™\İœ\›Z\ÜÚ[Û‹•Ô’UWÑVT“SÔÕÔQÑJBŸKÕ\Y\œ˜^J
-B‚œš]˜]H[ˆØ[Y\˜T\›Z\ÜÚ[ÛœÑÜ˜[Y
-ÛÛ^ˆ[™›ÚY˜ÛÛ[ÛÛ^
-Nˆ›ÛÛX[ˆH™\]Z\™YØ[Y\˜T\›Z\ÜÚ[ÛœÊ
-K˜[ÂˆÛÛ^ÛÛ\]˜ÚXÚÔÙ[”\›Z\ÜÚ[ÛŠÛÛ^]
-HOHXÚØYÙSX[˜YÙ\‹”T“RTÔÒSÓ—ÑÔS•QŸB‚œš]˜]H[ˆ\Ü^T›İ][Û‘YÜ™Y\Ê^\™UšY]Îˆ^\™UšY]ÊNˆ[HÚ[ˆ
-^\™UšY]Ë™\Ü^OËœ›İ][ÛˆÎˆİ\™˜XÙK”“ÕUSÓ—Ì
-HÂˆİ\™˜XÙK”“ÕUSÓ—ÎLOˆLˆİ\™˜XÙK”“ÕUSÓ—ÌNOˆNˆİ\™˜XÙK”“ÕUSÓ—ÌÌOˆÌˆ[ÙHOˆŸB‚œš]˜]H[ˆ™^›\Ú[ÙJİ\œ™[ˆØ[Y\˜Q›\Ú[ÙKİ\ÜYˆ›ÛÛX[ŠNˆØ[Y\˜Q›\Ú[ÙHÂˆYˆ
-\İ\ÜY
-H™]\›ˆØ[Y\˜Q›\Ú[ÙK“Ñ‘‚ˆ™]\›ˆÚ[ˆ
-İ\œ™[
-HÂˆØ[Y\˜Q›\Ú[ÙK“Ñ‘ˆOˆØ[Y\˜Q›\Ú[ÙKUUÂˆØ[Y\˜Q›\Ú[ÙKUUÈOˆØ[Y\˜Q›\Ú[ÙK“Ó‚ˆØ[Y\˜Q›\Ú[ÙK“ÓˆOˆØ[Y\˜Q›\Ú[ÙK•ÔÒˆØ[Y\˜Q›\Ú[ÙK•ÔÒOˆØ[Y\˜Q›\Ú[ÙK“Ñ‘‚ˆBŸB‚œš]˜]H[ˆ›\ÚX™[
-[ÙNˆØ[Y\˜Q›\Ú[ÙJNˆİš[™ÈHÚ[ˆ
-[ÙJHÂˆØ[Y\˜Q›\Ú[ÙK“Ñ‘ˆOˆ‘›\ÚÙ™ˆ‚ˆØ[Y\˜Q›\Ú[ÙKUUÈOˆ‘›\Ú]]È‚ˆØ[Y\˜Q›\Ú[ÙK“ÓˆOˆ‘›\ÚÛˆ‚ˆØ[Y\˜Q›\Ú[ÙK•ÔÒOˆ•Ü˜Ú‚ŸB‚œš]˜]H[ˆš[™İ]\Õ^
-™\İ[ˆØ[Y\˜Pš[™™\İ[ÊNˆİš[™ÏÈHÚ[ˆ
-™\İ[
-HÂˆ\ÈØ[Y\˜Pš[™™\İ[‘˜Z[\™HOˆ“[œÈ	Ü™\İ[˜Ø[Y\˜RYNˆ	Ü™\İ[œ™X\ÛÛŸH‚ˆ[ÙHOˆ[ŸB‚œš]˜]H[ˆÚÛÜÙQY˜][›İ]J›İ]\Îˆ\İ˜[XX›PØ[Y\˜T›İ]OŠNˆ˜[XX›PØ[Y\˜T›İ]OÈH›İ]\Ë›Z[SÜ“[È›İ]HO‚ˆ˜[\HH›İ]K˜Ø[Y\˜K™\]Z]˜[[›ØØ[[™İÓ[K›Z[“Ü“[
+private fun requiredCameraPermissions(): Array<String> = buildList {
+    add(Manifest.permission.CAMERA)
+    if (Build.VERSION.SDK_INT == Build.VERSION_CODES.P) {
+        add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+    }
+}.toTypedArray()
 
-HÎˆ™]\›Z[SÜ“[›Ø]“PVÕSQBˆ˜[›ÛT[˜[HHYˆ
-›İ]K˜Ø[Y\˜K˜Û\ÜÚYšXØ][Û‹œ›ÛHOH[œÔ›ÛK•ÒQJHˆ[ÙHL‚ˆ›ÛT[˜[H
-ÈXœÊ\HH™ŠBŸB‚œš]˜]H[ˆ[œÓX™[
-›İ]Nˆ˜[XX›PØ[Y\˜T›İ]KXZ[‘\Nˆ›Ø]ÊNˆİš[™ÈÂˆ˜[\HH›İ]K˜Ø[Y\˜K™\]Z]˜[[›ØØ[[™İÓ[K›Z[“Ü“[
+private fun cameraPermissionsGranted(context: Context): Boolean = requiredCameraPermissions().all {
+    ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+}
 
-BˆYˆ
-\HOH[	‰ˆXZ[‘\HOH[	‰ˆXZ[‘\HˆŠHÂˆ™]\›ˆİš[™Ë™›Ü›X]
-ØØ[K•TË‰KŒY°åò"ÂWòÖ–äW¢Ğ¢&WGW&âv†Vâ‡&÷WFRæ6ÖW&æ6Æ76–f–6F–öâç&öÆR’°¢ÆVç5&öÆRåTÅE$õt”DRÓâ%Ur"
-"ÆVç5&öÆRåDTÄU„õDòÓâ%FVÆR ¢ÆVç5&öÆRäÄôäuõDTÄU„õDòÓâ%FVÆR² ¢ÆVç5&öÆRäe$ôåBÓâ$g&öçB ¢VÇ6RÓâ&÷WFRæ6ÖW&æ–@¢Ğ§Ğ §&—fFRgVâÆVç4ÖævW%F—FÆR‡&÷WFS¢fÇV&ÆT6ÖW&&÷WFR“¢7G&–ærĞ¢"G·&÷WFRæ6ÖW&æ6Æ76–f–6F–öâç&öÆRææÖRç&WÆ6R‚uòrÂrr—Ò+r”BG·&÷WFRæ6ÖW&æ–GÒ  §&—fFRgVâÆVç4ÖævW%7V'F—FÆR‡&÷WFS¢fÇV&ÆT6ÖW&&÷WFR“¢7G&–ær°¢fÂWÒ&÷WFRæ6ÖW&æWV—fÆVçDfö6ÄÆVæwF‡4ÖÒæÖ–ä÷$çVÆÂ‚¢fÂ÷F–6ÂÒWòæÆWB²7G&–æræf÷&ÖB„Æö6ÆRåU2Â"RãbÖÒW"Â—B’Òó¢&÷F–72Væ¶æ÷vâ ¢fÂ&÷WF–ærÒv†Vâ‡&÷WFRæ66W72’°¢6ÖW&&÷WFT66W72äD•$T5Eô4ÔU$ôDUd”4RÓâ&F—&V7B6ÖW&" ¢6ÖW&&÷WFT66W72å…•4”4Åõd”ôÄôt”4ÂÓâ'f–Æöv–6ÂG·&÷WFRæÆöv–6Ä6ÖW&–G2æ¦ö–åFõ7G&–ær‚—Ò ¢Ğ¢&WGW&â"F÷F–6Â+rG&÷WF–ær §Ğ 
+private fun displayRotationDegrees(textureView: TextureView): Int = when (
+    textureView.display?.rotation ?: Surface.ROTATION_0
+) {
+    Surface.ROTATION_90 -> 90
+    Surface.ROTATION_180 -> 180
+    Surface.ROTATION_270 -> 270
+    else -> 0
+}
+
+private fun nextFlashMode(
+    current: CameraFlashMode,
+    supported: Boolean,
+): CameraFlashMode {
+    if (!supported) return CameraFlashMode.OFF
+    return when (current) {
+        CameraFlashMode.OFF -> CameraFlashMode.AUTO
+        CameraFlashMode.AUTO -> CameraFlashMode.ON
+        CameraFlashMode.ON -> CameraFlashMode.TORCH
+        CameraFlashMode.TORCH -> CameraFlashMode.OFF
+    }
+}
+
+private fun flashLabel(mode: CameraFlashMode): String = when (mode) {
+    CameraFlashMode.OFF -> "Flash Off"
+    CameraFlashMode.AUTO -> "Flash Auto"
+    CameraFlashMode.ON -> "Flash On"
+    CameraFlashMode.TORCH -> "Torch"
+}
+
+private fun bindStatusText(result: CameraBindResult?): String? = when (result) {
+    is CameraBindResult.Failure -> "Lens ${result.cameraId}: ${result.reason}"
+    else -> null
+}
+
+private fun chooseDefaultRoute(routes: List<ValuableCameraRoute>): ValuableCameraRoute? = routes.minByOrNull { route ->
+    val eq = route.camera.equivalentFocalLengthsMm.minOrNull()
+        ?: return@minByOrNull Float.MAX_VALUE
+    val rolePenalty = if (route.camera.classification.role == LensRole.WIDE) 0f else 100f
+    rolePenalty + abs(eq - 26f)
+}
+
+private fun lensLabel(
+    route: ValuableCameraRoute,
+    mainEq: Float?,
+): String {
+    val eq = route.camera.equivalentFocalLengthsMm.minOrNull()
+    if (eq != null && mainEq != null && mainEq > 0f) {
+        return String.format(Locale.US, "%.1fx", eq / mainEq)
+    }
+    return when (route.camera.classification.role) {
+        LensRole.ULTRA_WIDE -> "UW"
+        LensRole.TELEPHOTO -> "Tele"
+        LensRole.LONG_TELEPHOTO -> "Tele+"
+        LensRole.FRONT -> "Front"
+        else -> route.camera.id
+    }
+}
+
+private fun lensManagerTitle(route: ValuableCameraRoute): String =
+    "${route.camera.classification.role.name.replace('_', ' ')} - ID ${route.camera.id}"
+
+private fun lensManagerSubtitle(route: ValuableCameraRoute): String {
+    val eq = route.camera.equivalentFocalLengthsMm.minOrNull()
+    val optical = eq?.let { String.format(Locale.US, "%.1f mm eq", it) } ?: "optics unknown"
+    val access = when (route.access) {
+        CameraRouteAccess.DIRECT_CAMERA_DEVICE -> "direct Camera2"
+        CameraRouteAccess.PHYSICAL_VIA_LOGICAL -> "via logical ${route.logicalCameraIds.joinToString()}"
+    }
+    return "$optical - $access"
+}
