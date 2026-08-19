@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.view.Surface
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.viewfinder.compose.Viewfinder
@@ -79,7 +78,7 @@ fun ComputationalRawLabRoute(
     var bindResult by remember { mutableStateOf<ComputationalRawBindResult?>(null) }
     var preset by remember { mutableStateOf(ComputationalRawPreset.MAX) }
     var capturing by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf("C1 ready") }
+    var progress by remember { mutableStateOf("C2 ready") }
     var result by remember { mutableStateOf<ComputationalRawCaptureResult?>(null) }
     var latestUri by remember { mutableStateOf<Uri?>(null) }
     var lifecycleResumed by remember {
@@ -180,12 +179,12 @@ fun ComputationalRawLabRoute(
                     TextButton(onClick = onBack) { Text("Back", color = Color.White) }
                     Column(Modifier.weight(1f)) {
                         Text(
-                            "OmniCam Computational RAW · C1",
+                            "OmniCam Computational RAW · C2",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                         )
                         Text(
-                            "RAW burst → timestamp sync → align → motion reject → Bayer fusion → DNG",
+                            "RAW burst → align/fuse → demosaic → WB/color → HDR tone map → HEIF + DNG",
                             color = Color.White.copy(alpha = 0.65f),
                             style = MaterialTheme.typography.bodySmall,
                         )
@@ -303,7 +302,7 @@ fun ComputationalRawLabRoute(
                                 result = captured
                                 if (captured is ComputationalRawCaptureResult.Success) {
                                     latestUri = captured.uri
-                                    progress = "Saved computational DNG"
+                                    progress = "Saved C2 computational HEIF + merged DNG"
                                 } else if (captured is ComputationalRawCaptureResult.Failure) {
                                     progress = captured.message
                                 }
@@ -314,7 +313,7 @@ fun ComputationalRawLabRoute(
                         if (capturing) {
                             CircularProgressIndicator(Modifier.height(22.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.padding(horizontal = 5.dp))
-                            Text("Processing RAW burst…")
+                            Text("Computational processing…")
                         } else {
                             Text("Capture ${preset.frameCount}-frame C-RAW")
                         }
@@ -323,13 +322,13 @@ fun ComputationalRawLabRoute(
                     CrawResult(result)
                     latestUri?.let {
                         Text(
-                            "Saved to DCIM/OmniCam/C-RAW",
+                            "Saved HEIF + merged DNG to DCIM/OmniCam/C-RAW",
                             color = Color.White.copy(alpha = 0.55f),
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
                     Text(
-                        "C1 deliberately outputs a merged 16-bit Bayer DNG. The custom demosaic/color/tone-map → HEIF engine is the next stage, so this build does not pretend the DNG is a finished computational photo.",
+                        "C2 now produces a finished HEIF from the fused RAW buffer using OmniCam's software demosaic, Camera2 white balance/color matrix and HDR tone curve. The ~24 MB DNG is still saved as the merged 16-bit Bayer expert sidecar; its fixed size is expected for 4000×3000 RAW16.",
                         color = Color.White.copy(alpha = 0.55f),
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(horizontal = 18.dp, vertical = 7.dp),
@@ -357,17 +356,23 @@ private fun CrawResult(result: ComputationalRawCaptureResult?) {
             }
             Text(
                 buildString {
-                    append("Saved ")
+                    append("Saved C2 HEIF ")
                     append(result.width)
                     append('×')
                     append(result.height)
-                    append(" · ")
+                    append(" + merged DNG · ")
                     append(result.frameCount)
                     append(" RAW · ")
                     append(String.format(Locale.US, "%.1f%%", acceptedPercent))
-                    append(" merge samples · ")
+                    append(" merge samples · total ")
                     append(String.format(Locale.US, "%.1fs", result.elapsedMillis / 1000.0))
+                    append(" · C2 ")
+                    append(String.format(Locale.US, "%.1fs", result.c2ProcessingMillis / 1000.0))
                     if (result.maximumResolutionMode) append(" · max sensor mode")
+                    append("\nWB metadata: ")
+                    append(if (result.whiteBalanceFromCamera) "camera" else "fallback")
+                    append(" · color matrix: ")
+                    append(if (result.colorTransformFromCamera) "camera" else "fallback")
                     append("\nAlignment dx/dy/conf: ")
                     append(moves)
                 },
