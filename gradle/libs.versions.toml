@@ -7,10 +7,8 @@ lifecycle = "2.11.0"
 navigation = "2.9.8"
 composeBom = "2026.06.01"
 cameraX = "1.6.1"
-cameraViewfinder = "1.6.1"
 datastore = "1.2.1"
 coroutines = "1.11.0"
-heifWriter = "1.1.0"
 junit = "4.13.2"
 
 [libraries]
@@ -29,10 +27,7 @@ androidx-camera-core = { module = "androidx.camera:camera-core", version.ref = "
 androidx-camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "cameraX" }
 androidx-camera-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "cameraX" }
 androidx-camera-view = { module = "androidx.camera:camera-view", version.ref = "cameraX" }
-androidx-camera-viewfinder-core = { module = "androidx.camera.viewfinder:viewfinder-core", version.ref = "cameraViewfinder" }
-androidx-camera-viewfinder-compose = { module = "androidx.camera.viewfinder:viewfinder-compose", version.ref = "cameraViewfinder" }
 androidx-datastore-preferences = { module = "androidx.datastore:datastore-preferences", version.ref = "datastore" }
-androidx-heifwriter = { module = "androidx.heifwriter:heifwriter", version.ref = "heifWriter" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 junit = { module = "junit:junit", version.ref = "junit" }
 
