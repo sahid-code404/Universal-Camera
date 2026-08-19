@@ -27,8 +27,8 @@ jobs:
           cmdline-tools-version: 14742923
           packages: platform-tools
 
-      - name: Install Android API 37
-        run: sdkmanager --channel=3 "platforms;android-37" "build-tools;37.0.0"
+      - name: Install Android API 36
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
       - name: Set up Gradle 9.5
         uses: gradle/actions/setup-gradle@v4

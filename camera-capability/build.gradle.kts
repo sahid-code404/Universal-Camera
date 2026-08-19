@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.omnicam.camera.capability"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 28
