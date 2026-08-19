@@ -25,7 +25,9 @@ class MainActivity : ComponentActivity() {
                     diagnosticsViewModel = diagnosticsViewModel,
                     scanner = container.cameraCapabilityScanner,
                     previewController = container.camera2AuxPreviewController,
+                    photoController = container.camera2PhotoController,
                     lensPreferencesStore = container.lensPreferencesStore,
+                    devUpdateManager = container.devUpdateManager,
                 )
             }
         }
@@ -34,8 +36,5 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun OmniCamTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = darkColorScheme(),
-        content = content,
-    )
+    MaterialTheme(colorScheme = darkColorScheme(), content = content)
 }

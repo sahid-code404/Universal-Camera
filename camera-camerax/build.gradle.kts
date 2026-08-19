@@ -18,6 +18,7 @@ android {
 
 dependencies {
     implementation(project(":core-model"))
+    implementation(project(":camera-capability"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.camera.core)
     implementation(libs.androidx.camera.camera2)
