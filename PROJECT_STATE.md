@@ -4,7 +4,7 @@
 
 Phase 0 + Phase 1 implementation is **code-complete** on `phase-0-1-foundation`.
 
-Real-device validation is still required before beginning Phase 2.
+Physical-device validation has now uncovered and reproduced a vendor-specific auxiliary-camera exposure behavior on Xiaomi POCO M2 Pro. A separate experiment branch is validating actual preview/capture usability of those newly exposed IDs before Phase 2/3 architecture is finalized.
 
 ## Completed
 
@@ -38,24 +38,34 @@ Real-device validation is still required before beginning Phase 2.
 - Sanitized JSON device-report export.
 - Synthetic budget, logical-triple-camera, and RAW/manual device fixtures.
 - Lens classification and capability-fixture unit tests.
+- Camera1 cross-check and caller-identity exposure diagnostics.
+
+### Real-device finding — POCO M2 Pro
+
+Normal OmniCam identity (`com.omnicam.app`) exposes only 2 Camera2 IDs, 2 Camera1 devices, and no logical multi-camera group on the tested API 36 ROM.
+
+An isolated Snapcam-compatible client identity (`org.codeaurora.snapcam`) on the same phone exposes 8 Camera2 IDs, 6 Camera1 devices, and logical camera `61` with physical members `0` and `20`. Camera `21` reports ~15.6 mm equivalent focal length and is classified ULTRA_WIDE.
+
+This confirms that caller/client identity materially changes camera visibility on this tested ROM. It does **not** imply the same behavior across Xiaomi, Qualcomm, or Android devices generally.
 
 ## In Progress
 
-- Physical-device validation of Phase 1 discovery results.
+- `experiment-snapcam-aux-identity`: CameraX live preview and in-memory ImageCapture validation for every exposed rear ID.
+- Determine which enumerated POCO IDs are truly session/capture-capable and what optical role each usable ID represents.
 
 ## Known Issues / Intentional Limits
 
-- No physical Android device has been validated yet.
-- A physical camera ID disclosed by a logical camera is not assumed to be independently openable.
-- OEM-hidden/system cameras remain inaccessible by design.
-- Camera preview and still capture are not part of Phase 1 and are not implemented yet.
-- Auxiliary-lens capture/session routing is intentionally deferred to Phase 3 after discovery is validated.
+- An enumerated ID is not considered usable until an actual preview/session/capture succeeds.
+- Camera `22` is not yet labeled as macro; metadata alone is insufficient.
+- The Snapcam-compatible application ID is an isolated compatibility experiment and is **not** accepted as OmniCam's production identity.
+- OEM-hidden/system cameras remain inaccessible when the vendor stack does not expose them to the active caller identity.
+- Production still-photo UI and storage capture are not implemented yet.
 - OEM Camera Extensions and custom computational photography are intentionally deferred.
 - HEIF/Ultra HDR output policy is not implemented yet.
 
 ## Device-Specific Findings
 
-None yet. Populate `docs/DEVICE_COMPATIBILITY.md` only from real-device reports/tests.
+See `docs/DEVICE_COMPATIBILITY.md`.
 
 ## Architecture Decisions
 
@@ -63,29 +73,23 @@ None yet. Populate `docs/DEVICE_COMPATIBILITY.md` only from real-device reports/
 - Hardware capability is the source of truth.
 - Hybrid CameraX + Camera2 direction.
 - Camera2 powers low-level capability discovery.
-- Auxiliary cameras are supported only when exposed through public Android APIs.
+- Auxiliary cameras are supported only when exposed to the active client through the Android/vendor camera stack.
 - Android 9 / API 28 is the minimum baseline.
-- Physical logical-camera membership and direct openability are separate concepts.
-- Manual dependency injection is sufficient for Phase 1; revisit DI framework choice when the graph grows.
+- Physical logical-camera membership, enumeration visibility, and actual session usability are separate concepts.
+- Vendor caller-identity filtering is now a first-class compatibility concern, but production identity strategy remains unresolved pending broader testing.
+- Manual dependency injection is sufficient for current work; revisit DI framework choice when the graph grows.
 
 ## Tests / CI
 
-A full hosted CI run has successfully completed after the Gradle wrapper and final Phase 0/1 project cleanup were committed:
+The base Phase 0/1 hosted pipeline has passed Gradle wrapper validation, unit tests, Android lint, debug APK assembly, and artifact publication.
 
-- Gradle wrapper execution: passing.
-- Phase 1 unit tests: passing.
-- Android lint: passing.
-- Debug APK assembly: passing.
-- APK artifact publication: passing.
-
-The remaining gate is physical-device validation, not hosted build correctness.
+The Snapcam identity enumeration experiment also passed hosted CI. The newer live lens/session experiment is being iterated until its own CI is green.
 
 ## Next Phase
 
-1. Install the debug APK on physical Android devices.
-2. Grant camera permission.
-3. Verify every publicly visible camera/lens shown by diagnostics.
-4. Export `omnicam-device-report.json`.
-5. Add validated results to `docs/DEVICE_COMPATIBILITY.md`.
-6. Fix discovery/classification issues found on hardware.
-7. Begin Phase 2 — basic CameraX preview and reliable still capture — only after the discovery layer is trustworthy.
+1. Run the live lens test on POCO M2 Pro.
+2. Attempt preview + in-memory capture on each exposed rear Camera2 ID.
+3. Record successful/failed IDs and visually identify their true lens roles.
+4. Add validated routing rules to the compatibility model without hard-coding assumptions globally.
+5. Test a second OEM/device class to avoid overfitting the architecture to POCO/Xiaomi behavior.
+6. Begin the production Phase 2 CameraX preview/still-capture path and Phase 3 auxiliary routing with the validated compatibility strategies.
