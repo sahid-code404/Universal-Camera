@@ -7,6 +7,7 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -117,16 +118,6 @@ class CameraXPreviewController(
                     }
                 },
             )
-        }
-    }
-
-    suspend fun setZoomRatio(ratio: Float): Result<Unit> = withContext(Dispatchers.Main.immediate) {
-        val camera = boundCamera ?: return@withContext Result.failure(
-            IllegalStateException("No camera is currently bound"),
-        )
-        runCatching {
-            camera.cameraControl.setZoomRatio(ratio).get()
-            Unit
         }
     }
 
