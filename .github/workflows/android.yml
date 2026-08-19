@@ -12,7 +12,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -36,8 +36,8 @@ jobs:
           cmdline-tools-version: 14742923
           packages: platform-tools
 
-      - name: Install Android API 37
-        run: sdkmanager "platforms;android-37.0" "build-tools;37.0.0"
+      - name: Install Android API 37 + native toolchain
+        run: sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
 
       - name: Configure Gradle cache
         uses: gradle/actions/setup-gradle@v4
