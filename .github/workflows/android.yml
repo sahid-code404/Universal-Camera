@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, phase-0-1-foundation, experiment-snapcam-aux-identity, phase-2-camera-ui-updater, phase-2-camera-ui-dng-only]
   pull_request:
-    branches: [main, phase-0-1-foundation]
+    branches: [main, phase-0-1-foundation, phase-2-camera-ui-dng-only]
 
 permissions:
   contents: write
