@@ -83,10 +83,7 @@ sealed interface ComputationalRawBindResult {
 
 sealed interface ComputationalRawCaptureResult {
     data class Success(
-        /** Finished C2 computational HEIF. */
         val uri: Uri,
-        /** Optional expert/archive C1 merged Bayer DNG from the same burst. */
-        val dngUri: Uri,
         val width: Int,
         val height: Int,
         val frameCount: Int,
@@ -95,22 +92,18 @@ sealed interface ComputationalRawCaptureResult {
         val alignments: List<ComputationalRawEngine.Alignment>,
         val preset: ComputationalRawPreset,
         val elapsedMillis: Long,
-        val c2ProcessingMillis: Long,
         val maximumResolutionMode: Boolean,
-        val colorTransformFromCamera: Boolean,
-        val whiteBalanceFromCamera: Boolean,
     ) : ComputationalRawCaptureResult
 
     data class Failure(val message: String) : ComputationalRawCaptureResult
 }
 
 /**
- * Computational RAW controller.
+ * DNG-only computational RAW controller.
  *
- * C1 acquires/fuses RAW_SENSOR frames into one 16-bit Bayer buffer. C2 immediately takes that
- * fused Bayer buffer through OmniCam's own CPU demosaic, Camera2 WB/color transform and tone-map
- * pipeline to create a full-resolution HEIF. The merged Bayer DNG is kept as an expert/archive
- * sidecar so validation never hides the underlying computational RAW result.
+ * The camera still performs the full C1 burst acquisition, timestamp pairing, Bayer-safe alignment,
+ * motion rejection and multi-frame RAW fusion. The experimental C2 demosaic/color/HEIF stage is
+ * intentionally not invoked so capture completes as soon as the merged Bayer DNG is written.
  */
 class ComputationalRawController(context: Context) {
     private val appContext = context.applicationContext
@@ -124,7 +117,6 @@ class ComputationalRawController(context: Context) {
         imageHandler = imageHandler,
         scratchDir = java.io.File(appContext.cacheDir, "computational-raw"),
     )
-    private val processor = ComputationalRawProcessor(appContext)
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -156,7 +148,7 @@ class ComputationalRawController(context: Context) {
             width = previewSize.width,
             height = previewSize.height,
             requestId = buildString {
-                append("c2:")
+                append("c1-dng:")
                 append(route.camera.id)
                 append(':')
                 append(previewSize.width)
@@ -203,9 +195,7 @@ class ComputationalRawController(context: Context) {
         var lastError: Throwable? = null
         for (candidate in candidates) {
             closeCurrent()
-            val attempt = runCatching {
-                bindAttempt(surface, route, chars, candidate)
-            }
+            val attempt = runCatching { bindAttempt(surface, route, chars, candidate) }
             attempt.onSuccess { return@withContext it }
             lastError = attempt.exceptionOrNull()
         }
@@ -260,8 +250,7 @@ class ComputationalRawController(context: Context) {
         preset: ComputationalRawPreset,
         onProgress: (String) -> Unit = {},
     ): ComputationalRawCaptureResult {
-        val route = activeRoute
-            ?: return ComputationalRawCaptureResult.Failure("No computational RAW camera is active")
+        activeRoute ?: return ComputationalRawCaptureResult.Failure("No computational RAW camera is active")
         val device = cameraDevice
             ?: return ComputationalRawCaptureResult.Failure("Camera device is unavailable")
         val session = captureSession
@@ -276,19 +265,16 @@ class ComputationalRawController(context: Context) {
         val started = android.os.SystemClock.elapsedRealtime()
         return runCatching {
             val reference = latestPreviewResult ?: awaitReferenceResult(session)
-            val baseExposure = reference.get(CaptureResult.SENSOR_EXPOSURE_TIME)
-                ?: DEFAULT_EXPOSURE_NS
-            val baseIso = reference.get(CaptureResult.SENSOR_SENSITIVITY)
-                ?: DEFAULT_ISO
+            val baseExposure = reference.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: DEFAULT_EXPOSURE_NS
+            val baseIso = reference.get(CaptureResult.SENSOR_SENSITIVITY) ?: DEFAULT_ISO
             val focus = reference.get(CaptureResult.LENS_FOCUS_DISTANCE)
 
             onProgress(
-                "Capturing ${preset.frameCount} full-resolution RAW frames · " +
-                    "ISO $baseIso · ${formatExposure(baseExposure)}",
+                "Capturing ${preset.frameCount} full-resolution RAW frames · ISO $baseIso · ${formatExposure(baseExposure)}",
             )
-            withContext(Dispatchers.Default) {
+            val merged = withContext(Dispatchers.Default) {
                 runCatching { session.stopRepeating() }
-                val merged = try {
+                try {
                     engine.captureAndMerge(
                         device = device,
                         session = session,
@@ -322,37 +308,22 @@ class ComputationalRawController(context: Context) {
                 } finally {
                     resumePreview()
                 }
-                merged
-            }.let { merged ->
-                onProgress(
-                    "RAW fusion complete · saving merged DNG",
-                )
-                val dngUri = withContext(Dispatchers.IO) { saveMergedDng(merged, preset) }
-
-                onProgress(
-                    "C2 software ISP · demosaic → WB/color → HDR tone map → HEIF",
-                )
-                val processed = withContext(Dispatchers.Default) {
-                    processor.processAndSave(merged, preset)
-                }
-
-                ComputationalRawCaptureResult.Success(
-                    uri = processed.uri,
-                    dngUri = dngUri,
-                    width = merged.width,
-                    height = merged.height,
-                    frameCount = merged.frameCount,
-                    acceptedSamples = merged.acceptedSamples,
-                    rejectedSamples = merged.rejectedSamples,
-                    alignments = merged.alignments,
-                    preset = preset,
-                    elapsedMillis = android.os.SystemClock.elapsedRealtime() - started,
-                    c2ProcessingMillis = processed.processingMillis,
-                    maximumResolutionMode = candidate.maximumResolutionMode,
-                    colorTransformFromCamera = processed.colorTransformFromCamera,
-                    whiteBalanceFromCamera = processed.whiteBalanceFromCamera,
-                )
             }
+
+            onProgress("RAW fusion complete · writing merged DNG")
+            val uri = withContext(Dispatchers.IO) { saveMergedDng(merged, preset) }
+            ComputationalRawCaptureResult.Success(
+                uri = uri,
+                width = merged.width,
+                height = merged.height,
+                frameCount = merged.frameCount,
+                acceptedSamples = merged.acceptedSamples,
+                rejectedSamples = merged.rejectedSamples,
+                alignments = merged.alignments,
+                preset = preset,
+                elapsedMillis = android.os.SystemClock.elapsedRealtime() - started,
+                maximumResolutionMode = candidate.maximumResolutionMode,
+            )
         }.getOrElse { error ->
             runCatching { resumePreview() }
             ComputationalRawCaptureResult.Failure(error.message ?: error::class.java.simpleName)
@@ -403,9 +374,7 @@ class ComputationalRawController(context: Context) {
         val session = captureSession ?: return
         val builder = previewBuilder ?: return
         cameraHandler.post {
-            runCatching {
-                session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler)
-            }
+            runCatching { session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler) }
         }
     }
 
@@ -434,7 +403,7 @@ class ComputationalRawController(context: Context) {
                     merged.referenceResult,
                 ).use { creator ->
                     creator.setDescription(
-                        "OmniCam C1 ${preset.name}: ${merged.frameCount}-frame aligned RAW fusion; C2 HEIF companion generated by OmniCam software ISP",
+                        "OmniCam C-RAW ${preset.name}: ${merged.frameCount}-frame aligned RAW fusion",
                     )
                     creator.writeByteBuffer(
                         output,
@@ -560,11 +529,10 @@ class ComputationalRawController(context: Context) {
                 )
             }
         }
-        runCatching {
-            device.createCaptureSession(listOf(preview, raw), callback, cameraHandler)
-        }.onFailure {
-            if (continuation.isActive) continuation.resumeWithException(it)
-        }
+        runCatching { device.createCaptureSession(listOf(preview, raw), callback, cameraHandler) }
+            .onFailure {
+                if (continuation.isActive) continuation.resumeWithException(it)
+            }
     }
 
     private fun closeCurrent() {
