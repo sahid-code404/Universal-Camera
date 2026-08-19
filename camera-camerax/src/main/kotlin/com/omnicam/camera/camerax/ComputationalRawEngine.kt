@@ -16,11 +16,8 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -29,12 +26,12 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
 
 /**
- * Phase C1 computational RAW engine.
+ * Computational RAW acquisition engine.
  *
- * RAW images are paired with TotalCaptureResult by SENSOR_TIMESTAMP, packed immediately into
- * file-backed RAW16 scratch buffers, aligned on the Bayer grid, motion/outlier rejected, then
- * fused into one 16-bit Bayer buffer at the reference exposure. C1 deliberately stays in the RAW
- * domain; custom demosaic/color/tone-map and multi-frame super-resolution are later stages.
+ * RAW images are paired with TotalCaptureResult by SENSOR_TIMESTAMP and staged immediately into
+ * tightly packed file-backed RAW16 buffers so Camera2/ImageReader buffers are released quickly.
+ * C1.5 delegates alignment and fusion to ComputationalRawMerger, which performs sparse two-stage
+ * Bayer alignment, noise-aware temporal weighting and a multi-core full-resolution merge.
  */
 class ComputationalRawEngine(
     private val cameraHandler: Handler,
@@ -87,19 +84,6 @@ class ComputationalRawEngine(
         val blackLevels: IntArray,
         val whiteLevel: Int,
     )
-
-    private class RawAccessor(
-        private val buffer: MappedByteBuffer,
-        val width: Int,
-        val height: Int,
-    ) {
-        init {
-            buffer.order(ByteOrder.nativeOrder())
-        }
-
-        fun get(x: Int, y: Int): Int =
-            buffer.getShort((y * width + x) * BYTES_PER_RAW_PIXEL).toInt() and 0xffff
-    }
 
     suspend fun captureAndMerge(
         device: CameraDevice,
@@ -325,6 +309,9 @@ class ComputationalRawEngine(
                 require(pixelStride >= BYTES_PER_RAW_PIXEL) {
                     "Unsupported RAW_SENSOR pixel stride $pixelStride"
                 }
+
+                // Most RAW_SENSOR devices use two tightly packed bytes per sample. When row padding
+                // exists we still copy complete rows in one channel write instead of per-pixel I/O.
                 val packedRow = ByteBuffer.allocateDirect(width * BYTES_PER_RAW_PIXEL)
                     .order(ByteOrder.nativeOrder())
                 for (y in 0 until height) {
@@ -358,159 +345,34 @@ class ComputationalRawEngine(
         characteristics: CameraCharacteristics,
     ): MergeResult {
         require(frames.size >= MIN_BURST_FRAMES)
-        val referenceIndex = frames.indices.maxByOrNull { frames[it].exposureTimeNs } ?: 0
-        val reference = frames[referenceIndex]
-        require(frames.all { it.width == reference.width && it.height == reference.height }) {
-            "RAW burst dimensions changed during capture"
-        }
-
-        val accessors = frames.map { frame ->
-            FileChannel.open(frame.file.toPath()).use { channel ->
-                RawAccessor(
-                    channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size()),
-                    frame.width,
-                    frame.height,
+        val fusion = ComputationalRawMerger.merge(
+            frames = frames.map { frame ->
+                ComputationalRawMerger.Frame(
+                    width = frame.width,
+                    height = frame.height,
+                    file = frame.file,
+                    result = frame.result,
+                    exposureTimeNs = frame.exposureTimeNs,
+                    iso = frame.iso,
+                    blackLevels = frame.blackLevels,
+                    whiteLevel = frame.whiteLevel,
                 )
-            }
-        }
-        val alignments = frames.mapIndexed { index, frame ->
-            if (index == referenceIndex) Alignment(0, 0, 1f)
-            else estimateTranslation(reference, accessors[referenceIndex], frame, accessors[index])
-        }
-
-        val output = ByteBuffer.allocateDirect(reference.width * reference.height * BYTES_PER_RAW_PIXEL)
-            .order(ByteOrder.nativeOrder())
-        var accepted = 0L
-        var rejected = 0L
-        val refWhite = reference.whiteLevel.toFloat()
-        val refExposure = reference.exposureTimeNs.toDouble().coerceAtLeast(1.0)
-        val refIso = reference.iso.toDouble().coerceAtLeast(1.0)
-        val referenceAccessor = accessors[referenceIndex]
-
-        for (y in 0 until reference.height) {
-            for (x in 0 until reference.width) {
-                val refBlack = blackLevel(reference.blackLevels, x, y).toFloat()
-                val refRaw = referenceAccessor.get(x, y)
-                val refLinear = ((refRaw - refBlack) / (refWhite - refBlack).coerceAtLeast(1f))
-                    .coerceIn(0f, 1f)
-                var weighted = refLinear.toDouble()
-                var weightSum = 1.0
-
-                for (i in frames.indices) {
-                    if (i == referenceIndex) continue
-                    val frame = frames[i]
-                    val alignment = alignments[i]
-                    if (alignment.confidence < MIN_ALIGNMENT_CONFIDENCE) {
-                        rejected++
-                        continue
-                    }
-                    val sx = x + alignment.dx
-                    val sy = y + alignment.dy
-                    if (sx !in 0 until frame.width || sy !in 0 until frame.height) {
-                        rejected++
-                        continue
-                    }
-                    val frameBlack = blackLevel(frame.blackLevels, sx, sy).toFloat()
-                    val value = accessors[i].get(sx, sy)
-                    val linear = ((value - frameBlack) /
-                        (frame.whiteLevel - frameBlack).coerceAtLeast(1f)).coerceIn(0f, 1f)
-                    val normalized = linear.toDouble() *
-                        (refExposure / frame.exposureTimeNs.toDouble().coerceAtLeast(1.0)) *
-                        (refIso / frame.iso.toDouble().coerceAtLeast(1.0))
-                    val delta = abs(normalized - refLinear.toDouble())
-                    val motionThreshold = BASE_MOTION_THRESHOLD + refLinear * BRIGHT_MOTION_ALLOWANCE
-                    if (delta > motionThreshold) {
-                        rejected++
-                        continue
-                    }
-                    val exposureWeight = when {
-                        linear < 0.01f -> 0.15
-                        linear > 0.97f -> 0.08
-                        linear > 0.90f -> 0.45
-                        else -> 1.0
-                    }
-                    val confidenceWeight = alignment.confidence
-                        .coerceIn(MIN_ALIGNMENT_CONFIDENCE, 1f)
-                        .toDouble()
-                    val weight = exposureWeight * confidenceWeight
-                    weighted += normalized * weight
-                    weightSum += weight
-                    accepted++
-                }
-
-                val mergedLinear = (weighted / weightSum).coerceIn(0.0, 1.0)
-                val encoded = (refBlack + mergedLinear * (refWhite - refBlack))
-                    .roundToLong().coerceIn(0L, 65535L).toInt()
-                output.putShort(encoded.toShort())
-            }
-        }
-        output.flip()
-
+            },
+            characteristics = characteristics,
+        )
+        val reference = frames[fusion.referenceIndex]
         return MergeResult(
             width = reference.width,
             height = reference.height,
-            pixels16 = output,
+            pixels16 = fusion.pixels16,
             referenceResult = reference.result,
             referenceCharacteristics = characteristics,
             frameCount = frames.size,
-            acceptedSamples = accepted,
-            rejectedSamples = rejected,
-            alignments = alignments,
+            acceptedSamples = fusion.acceptedSamples,
+            rejectedSamples = fusion.rejectedSamples,
+            alignments = fusion.alignments,
             whiteLevel = reference.whiteLevel,
         )
-    }
-
-    /** C1 keeps even-pixel shifts only so the 2×2 Bayer CFA phase cannot be swapped. */
-    private fun estimateTranslation(
-        reference: CapturedRawFrame,
-        referenceAccessor: RawAccessor,
-        candidate: CapturedRawFrame,
-        candidateAccessor: RawAccessor,
-    ): Alignment {
-        var bestScore = Double.POSITIVE_INFINITY
-        var secondScore = Double.POSITIVE_INFINITY
-        var bestDx = 0
-        var bestDy = 0
-        for (dy in -ALIGNMENT_SEARCH_RADIUS..ALIGNMENT_SEARCH_RADIUS step CFA_PERIOD) {
-            for (dx in -ALIGNMENT_SEARCH_RADIUS..ALIGNMENT_SEARCH_RADIUS step CFA_PERIOD) {
-                var error = 0.0
-                var count = 0
-                var y = ALIGNMENT_BORDER
-                while (y < reference.height - ALIGNMENT_BORDER) {
-                    var x = ALIGNMENT_BORDER
-                    while (x < reference.width - ALIGNMENT_BORDER) {
-                        val cx = x + dx
-                        val cy = y + dy
-                        if (cx in 0 until candidate.width && cy in 0 until candidate.height) {
-                            val refBlack = blackLevel(reference.blackLevels, x, y)
-                            val candidateBlack = blackLevel(candidate.blackLevels, cx, cy)
-                            val a = referenceAccessor.get(x, y) - refBlack
-                            val b = candidateAccessor.get(cx, cy) - candidateBlack
-                            val scale = reference.exposureTimeNs.toDouble() * reference.iso /
-                                (candidate.exposureTimeNs.toDouble().coerceAtLeast(1.0) *
-                                    candidate.iso.coerceAtLeast(1))
-                            error += abs(a - b * scale)
-                            count++
-                        }
-                        x += ALIGNMENT_SAMPLE_STEP
-                    }
-                    y += ALIGNMENT_SAMPLE_STEP
-                }
-                val score = if (count > 0) error / count else Double.POSITIVE_INFINITY
-                if (score < bestScore) {
-                    secondScore = bestScore
-                    bestScore = score
-                    bestDx = dx
-                    bestDy = dy
-                } else if (score < secondScore) {
-                    secondScore = score
-                }
-            }
-        }
-        val separation = if (secondScore.isFinite() && secondScore > 0.0) {
-            ((secondScore - bestScore) / secondScore).coerceIn(0.0, 1.0)
-        } else 0.0
-        return Alignment(bestDx, bestDy, max(MIN_ALIGNMENT_CONFIDENCE, separation.toFloat()))
     }
 
     private fun staticBlackLevels(characteristics: CameraCharacteristics): IntArray {
@@ -527,9 +389,6 @@ class ComputationalRawEngine(
         }
     }
 
-    private fun blackLevel(levels: IntArray, x: Int, y: Int): Int =
-        levels[(y and 1) * CFA_PERIOD + (x and 1)]
-
     private fun defaultOffsets(frameCount: Int): List<Float> = List(frameCount) { index ->
         when {
             index == 0 -> -2f
@@ -542,14 +401,7 @@ class ComputationalRawEngine(
         const val MIN_BURST_FRAMES = 3
         const val MAX_BURST_FRAMES = 12
         const val BYTES_PER_RAW_PIXEL = 2
-        const val CFA_PERIOD = 2
         const val BURST_TIMEOUT_MS = 30_000L
         const val FRAME_DURATION_MARGIN_NS = 1_000_000L
-        const val ALIGNMENT_SEARCH_RADIUS = 8
-        const val ALIGNMENT_BORDER = 48
-        const val ALIGNMENT_SAMPLE_STEP = 8
-        const val MIN_ALIGNMENT_CONFIDENCE = 0.15f
-        const val BASE_MOTION_THRESHOLD = 0.035
-        const val BRIGHT_MOTION_ALLOWANCE = 0.08
     }
 }
