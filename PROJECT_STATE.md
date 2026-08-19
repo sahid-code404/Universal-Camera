@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-Phase 0 + Phase 1 are code-complete and validated on the first real hardware target. Phase 2 is now **code-complete on `phase-2-camera-ui-updater`** and is awaiting physical-device camera-quality/UX validation.
+Phase 0 + Phase 1 are code-complete and validated on the first real hardware target. Phase 2 camera routing/capture is active on `phase-2-camera-ui-updater`; HEIF, multi-aspect preview, RAW/DNG, and first manual Pro controls are now implemented and require physical-device validation.
 
 ## Completed
 
@@ -56,17 +56,44 @@ Phase 0 + Phase 1 are code-complete and validated on the first real hardware tar
 - Useful-lens selector integrated into the main camera UI.
 - Exact direct Camera2 routing for vendor-exposed auxiliary cameras.
 - Standard physical-via-logical output routing for compliant logical multi-camera devices.
-- JPEG still capture using a preview + ImageReader Camera2 session.
-- JPEG saving through MediaStore to `DCIM/OmniCam` on modern Android.
 - Rear/front switching.
 - Tap-to-focus with AF/AE metering region support where exposed.
 - Exposure compensation control where exposed.
 - Pinch zoom plus zoom slider.
 - Flash Off / Auto / On / Torch where flash is available.
-- 4:3 and 16:9 capture selection.
-- Latest-capture thumbnail.
-- Orientation metadata handling for JPEG capture.
+- Aspect ratios: 1:1, 3:2, 4:3, 16:9, and 2:1.
+- Viewfinder aspect/layout and TextureView transforms avoid non-uniform stretching.
+- Camera lifecycle release/rebind prevents frozen preview after leaving for Gallery and returning.
+- Latest-capture thumbnail opens the captured item in an external gallery/viewer.
 - Camera diagnostics and lens manager remain accessible from the camera UI.
+
+### Photo formats
+
+- JPEG still capture and MediaStore saving to `DCIM/OmniCam`.
+- Native Camera2 HEIC is preferred when the active route/session exposes `ImageFormat.HEIC`.
+- If native HEIC is absent, OmniCam captures `YUV_420_888` and encodes a real HEIF with AndroidX `HeifWriter` / the device HEVC encoder.
+- JPEG remains the final compatibility fallback for HEIF.
+- Software-HEIF YUV packing uses bulk row copies where the plane layout permits it.
+- HEIF/DNG file finalization now runs outside the shutter-critical path: the camera returns to an available shutter after the frame is safely acquired while encode/publish finishes in the background.
+- Compression quality remains user-selectable for HEIF/JPEG.
+
+### RAW / DNG
+
+- Added `PhotoOutputFormat.DNG`.
+- RAW DNG is offered only when the selected valuable route advertises RAW, exposes `RAW_SENSOR` output, and is independently openable as a Camera2 device.
+- DNG capture uses the real RAW `Image` plus `TotalCaptureResult` through Android `DngCreator`.
+- Unsupported routes fall back rather than pretending a processed image is RAW.
+- DNG uses native sensor dimensions rather than the processed-photo aspect crop.
+
+### Pro controls
+
+- Added capability-gated manual sensor mode.
+- Manual ISO uses the lens-reported sensitivity range.
+- Manual shutter uses the lens-reported exposure-time range with logarithmic UI control.
+- Manual focus uses lens focus distance in diopters when the lens exposes it; infinity is represented by 0 diopters.
+- Manual mode disables AE/AF and applies sensor ISO/exposure/frame-duration requests.
+- Auto white balance remains enabled in this first Pro implementation.
+- Flash Auto/On are not used while AE is disabled; Torch remains possible where supported.
 
 ### Development update channel
 
@@ -81,7 +108,7 @@ Phase 0 + Phase 1 are code-complete and validated on the first real hardware tar
 
 ## CI Status
 
-The Phase 2 code path has completed a green hosted CI run:
+The Phase 2.3 code path has completed a green hosted CI run:
 
 - Gradle wrapper verification: passing.
 - camera-capability unit tests: passing.
@@ -92,22 +119,24 @@ The Phase 2 code path has completed a green hosted CI run:
 
 ## In Progress
 
-- Physical-device validation of Phase 2 preview/capture behavior.
-- Validate JPEG orientation on portrait/landscape captures.
-- Validate focus, EV, zoom, flash, lens switching, and MediaStore output on real hardware.
-- Validate development APK update-over-install behavior.
+- Measure real-device HEIF shutter latency separately from background HEVC completion time.
+- Validate back-to-back HEIF captures while one or more files are still finalizing.
+- Validate DNG capture/readability on each RAW-capable independently openable lens.
+- Validate manual ISO/shutter/focus behavior and range boundaries on real hardware.
+- Validate portrait/landscape orientation for HEIF/JPEG and RAW editor interpretation for DNG.
 - Validate physical-via-logical capture on a standards-based modern multi-camera device.
 - Expand Snapdragon/OEM coverage before treating vendor-filtered auxiliary access as broadly proven.
 
 ## Known Issues / Intentional Limits
 
 - The `org.codeaurora.snapcam` application identity is still a temporary compatibility identity for the vendor-filtered hardware test path, not the final OmniCam production package decision.
-- The first APK signed with the new stable development key may require uninstalling an older experiment that was signed by an ephemeral debug key. After that migration, later development builds should update in place.
+- The first APK signed with the stable development key may require uninstalling an older experiment signed by an ephemeral debug key; later development builds update in place.
 - Android still displays its normal package-install confirmation during sideloaded updates.
 - Package allowlisting behavior varies by OEM/ROM; a Snapdragon SoC alone does not guarantee Snapcam-identity auxiliary exposure.
 - A metadata-distinct route can still fail Camera2 session configuration; actual session creation remains the final authority.
-- OEM-hidden/system cameras remain inaccessible unless the vendor exposes a permitted route.
-- Video, HEIF/Ultra HDR, RAW production flow, Pro mode, OEM Extensions, custom HDR, Night, denoise, and super-resolution are later phases.
+- RAW through physical-via-logical-only routes is not enabled yet because DNG metadata/result association needs separate physical-result validation.
+- Software HEIF still takes device-dependent time to finish HEVC encoding, but that work no longer blocks the shutter for the full save duration.
+- Manual white balance, focus peaking, histogram/zebras, video, Ultra HDR, OEM Extensions, custom HDR, Night, denoise, and super-resolution remain later work.
 
 ## Architecture Decisions
 
@@ -120,13 +149,14 @@ The Phase 2 code path has completed a green hosted CI run:
 - Physical members behind logical cameras are valid user lenses when they can be routed using standard Camera2 physical outputs.
 - User enable/disable/order is a preference layer on top of capability resolution.
 - Direct Camera2 remains available when CameraX filters otherwise usable vendor auxiliary IDs.
+- A requested file format is distinct from the actual pipeline; unsupported formats must report/fallback rather than masquerade as another format.
 - Development signing and production signing are intentionally separate security domains.
 
 ## Next Phase
 
-1. Install the Phase 2 stable-development-signed APK on physical hardware.
-2. Complete `docs/PHASE2_DEVICE_TEST.md`.
-3. Verify the immediate `dev-latest` update path.
-4. Fix any real-device capture/orientation/session issues found.
-5. Validate on additional OEM/SoC combinations.
-6. Begin formats/Pro/video work only after basic photo capture is trustworthy.
+1. Physical-test Phase 2.3 HEIF latency, DNG, and Pro controls.
+2. Add manual white balance, histogram/zebras, and focus peaking after manual sensor behavior is validated.
+3. Add robust burst/bracketing primitives needed by custom HDR/Night.
+4. Add video with H.264/HEVC capability-driven profiles.
+5. Add Ultra HDR / gain-map support where Android/device capabilities permit it.
+6. Begin computational HDR/Night/denoise only after the capture primitives are stable.
