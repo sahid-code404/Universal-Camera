@@ -1,6 +1,15 @@
+import java.util.Base64
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+}
+
+val devKeySource = rootProject.file(".github/dev-signing/omnicam-dev.jks.b64")
+val devKeyFile = layout.buildDirectory.file("generated/dev-signing/omnicam-dev.jks").get().asFile
+if (devKeySource.exists()) {
+    devKeyFile.parentFile.mkdirs()
+    devKeyFile.writeBytes(Base64.getDecoder().decode(devKeySource.readText().trim()))
 }
 
 android {
@@ -8,15 +17,23 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        // TEMPORARY DIAGNOSTIC IDENTITY ONLY.
-        // Some Qualcomm/Xiaomi camera providers historically expose auxiliary
-        // cameras only to allowlisted client package names such as this one.
-        // Do not merge this applicationId into OmniCam production.
+        // Temporary compatibility identity while vendor-filtered Snapdragon auxiliary access is validated.
         applicationId = "org.codeaurora.snapcam"
         minSdk = 28
         targetSdk = 37
-        versionCode = 9002
-        versionName = "0.1.0-snapcam-live-lens-test"
+        versionCode = providers.environmentVariable("OMNICAM_VERSION_CODE").orNull?.toIntOrNull() ?: 9200
+        versionName = providers.environmentVariable("OMNICAM_VERSION_NAME").orNull ?: "0.2.0-dev"
+        buildConfigField("String", "DEV_UPDATE_REPO", "\"sahid-code404/Universal-Camera\"")
+        buildConfigField("String", "DEV_UPDATE_TAG", "\"dev-latest\"")
+    }
+
+    signingConfigs {
+        create("development") {
+            storeFile = devKeyFile
+            storePassword = "omnicam-dev"
+            keyAlias = "omnicam-dev"
+            keyPassword = "omnicam-dev"
+        }
     }
 
     buildFeatures {
@@ -25,8 +42,12 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("development")
+        }
         release {
             isMinifyEnabled = false
+            // Intentionally not signed with the public development key.
         }
     }
 
@@ -42,6 +63,7 @@ dependencies {
     implementation(project(":feature-camera"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.navigation.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
