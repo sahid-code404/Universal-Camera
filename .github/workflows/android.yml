@@ -1,0 +1,82 @@
+name: Android CI
+
+on:
+  push:
+    branches: [main, phase-0-1-foundation, experiment-snapcam-aux-identity, phase-2-camera-ui-updater]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set development version
+        shell: bash
+        run: |
+          echo "OMNICAM_VERSION_CODE=$((200000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+          echo "OMNICAM_VERSION_NAME=0.2.0-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 14742923
+          packages: platform-tools
+
+      - name: Install Android API 37 + native toolchain
+        run: sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Configure Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Verify Gradle wrapper
+        run: ./gradlew --version
+
+      - name: Unit tests
+        run: ./gradlew :camera-capability:testDebugUnitTest --stacktrace
+
+      - name: Lint
+        run: ./gradlew lintDebug --stacktrace
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Prepare update APK
+        if: success()
+        shell: bash
+        run: cp app/build/outputs/apk/debug/app-debug.apk "OmniCam-dev-v${OMNICAM_VERSION_CODE}.apk"
+
+      - name: Upload debug APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omnicam-phase2-debug
+          path: OmniCam-dev-v*.apk
+          if-no-files-found: error
+
+      - name: Publish dev-latest update channel
+        if: success() && github.event_name == 'push' && github.ref_name == 'phase-2-camera-ui-updater'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release delete dev-latest --yes || true
+          git push origin :refs/tags/dev-latest || true
+          gh release create dev-latest "OmniCam-dev-v${OMNICAM_VERSION_CODE}.apk" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "OmniCam development update" \
+            --notes "Development hardware-test build. versionCode=${OMNICAM_VERSION_CODE}. Signed with the public OmniCam development key; never use this channel for production."
