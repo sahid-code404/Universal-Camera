@@ -5,13 +5,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -107,159 +107,179 @@ fun CameraLensTestRoute(
             profile == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
             }
-            else -> {
-                val scanned = profile ?: return@Surface
-                val backCameras = scanned.cameras
-                    .filter { it.directlyListed && it.lensFacing == LensFacing.BACK }
-                    .sortedWith(compareBy<CameraDescriptor> { it.equivalentFocalLengthsMm.minOrNull() ?: Float.MAX_VALUE }.thenBy { it.id })
-                val main = chooseDefaultRearCamera(scanned)
-                val mainEq = main?.equivalentFocalLengthsMm?.minOrNull()
-
-                Column(Modifier.fillMaxSize()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                            .background(Color.Black),
-                    ) {
-                        AndroidView(
-                            factory = { previewView },
-                            modifier = Modifier.fillMaxSize(),
-                        )
-
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 12.dp, vertical = 14.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            TextButton(onClick = onBack) {
-                                Text("‹ Diagnostics", color = Color.White)
-                            }
-                            Text(
-                                "LIVE AUX TEST",
-                                color = Color.White,
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.Bold,
-                            )
-                        }
-
-                        val status = when (val result = bindResult) {
-                            is CameraBindResult.Success -> "Requested ${result.requestedCameraId} · active ${result.actualCameraId}"
-                            is CameraBindResult.Failure -> "Camera ${result.cameraId} failed: ${result.reason}"
-                            null -> if (binding) "Opening camera…" else "Select a camera"
-                        }
-                        Surface(
-                            modifier = Modifier
-                                .align(Alignment.TopCenter)
-                                .padding(top = 58.dp),
-                            color = Color.Black.copy(alpha = 0.58f),
-                            shape = RoundedCornerShape(18.dp),
-                        ) {
-                            Text(
-                                status,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                                color = Color.White,
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
+            else -> LensTestContent(
+                profile = requireNotNull(profile),
+                previewView = previewView,
+                selectedCameraId = selectedCameraId,
+                bindResult = bindResult,
+                captureResult = captureResult,
+                binding = binding,
+                capturing = capturing,
+                onBack = onBack,
+                onSelectCamera = { selectedCameraId = it },
+                onCapture = {
+                    capturing = true
+                    scope.launch {
+                        captureResult = previewController.captureProbe()
+                        capturing = false
                     }
+                },
+            )
+        }
+    }
+}
 
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color.Black)
-                            .padding(vertical = 12.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        Text(
-                            "${backCameras.size} exposed rear Camera2 IDs",
-                            color = Color.White.copy(alpha = 0.72f),
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        LazyRow(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp),
-                        ) {
-                            items(backCameras, key = { it.id }) { camera ->
-                                val selected = camera.id == selectedCameraId
-                                val label = cameraZoomLabel(camera, mainEq)
-                                if (selected) {
-                                    Button(
-                                        onClick = {},
-                                        shape = CircleShape,
-                                    ) {
-                                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                            Text(label)
-                                            Text("ID ${camera.id}", style = MaterialTheme.typography.labelSmall)
-                                        }
-                                    }
-                                } else {
-                                    OutlinedButton(
-                                        onClick = { selectedCameraId = camera.id },
-                                        shape = CircleShape,
-                                    ) {
-                                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                            Text(label, color = Color.White)
-                                            Text("ID ${camera.id}", color = Color.White.copy(alpha = 0.65f), style = MaterialTheme.typography.labelSmall)
-                                        }
-                                    }
-                                }
-                            }
-                        }
+@Composable
+private fun LensTestContent(
+    profile: DeviceCameraProfile,
+    previewView: PreviewView,
+    selectedCameraId: String?,
+    bindResult: CameraBindResult?,
+    captureResult: CaptureProbeResult?,
+    binding: Boolean,
+    capturing: Boolean,
+    onBack: () -> Unit,
+    onSelectCamera: (String) -> Unit,
+    onCapture: () -> Unit,
+) {
+    val backCameras = profile.cameras
+        .filter { it.directlyListed && it.lensFacing == LensFacing.BACK }
+        .sortedWith(
+            compareBy<CameraDescriptor> { it.equivalentFocalLengthsMm.minOrNull() ?: Float.MAX_VALUE }
+                .thenBy { it.id },
+        )
+    val mainEq = chooseDefaultRearCamera(profile)?.equivalentFocalLengthsMm?.minOrNull()
 
-                        Spacer(Modifier.height(10.dp))
-                        val selected = backCameras.firstOrNull { it.id == selectedCameraId }
-                        if (selected != null) {
-                            Text(
-                                selectedLensDescription(selected),
-                                color = Color.White,
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
+    Column(Modifier.fillMaxSize().background(Color.Black)) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(430.dp)
+                .background(Color.Black),
+        ) {
+            AndroidView(
+                factory = { previewView },
+                modifier = Modifier.fillMaxSize(),
+            )
 
-                        Spacer(Modifier.height(12.dp))
-                        Button(
-                            enabled = bindResult is CameraBindResult.Success && !capturing,
-                            onClick = {
-                                capturing = true
-                                scope.launch {
-                                    captureResult = previewController.captureProbe()
-                                    capturing = false
-                                }
-                            },
-                            shape = CircleShape,
-                        ) {
-                            Text(if (capturing) "Capturing…" else "Capture probe")
-                        }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onBack) { Text("‹ Diagnostics", color = Color.White) }
+                Text(
+                    "LIVE AUX TEST",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
 
-                        val captureText = when (val result = captureResult) {
-                            is CaptureProbeResult.Success -> "Capture OK · ID ${result.cameraId} · ${result.width}×${result.height} · format ${result.format}"
-                            is CaptureProbeResult.Failure -> "Capture failed: ${result.reason}"
-                            null -> "This probe keeps the frame in memory and does not save a photo."
-                        }
-                        Text(
-                            captureText,
-                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
-                            color = Color.White.copy(alpha = 0.72f),
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                }
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 60.dp),
+                color = Color.Black.copy(alpha = 0.62f),
+                shape = RoundedCornerShape(18.dp),
+            ) {
+                Text(
+                    bindStatus(bindResult, binding),
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
         }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                "${backCameras.size} exposed rear Camera2 IDs",
+                color = Color.White.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(8.dp))
+
+            LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(horizontal = 16.dp),
+            ) {
+                items(backCameras, key = { it.id }) { camera ->
+                    LensButton(
+                        camera = camera,
+                        label = cameraZoomLabel(camera, mainEq),
+                        selected = camera.id == selectedCameraId,
+                        onClick = { onSelectCamera(camera.id) },
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+            backCameras.firstOrNull { it.id == selectedCameraId }?.let { selected ->
+                Text(
+                    selectedLensDescription(selected),
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Button(
+                enabled = bindResult is CameraBindResult.Success && !capturing,
+                onClick = onCapture,
+                shape = CircleShape,
+            ) {
+                Text(if (capturing) "Capturing…" else "Capture probe")
+            }
+
+            Text(
+                captureStatus(captureResult),
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                color = Color.White.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun LensButton(
+    camera: CameraDescriptor,
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val content: @Composable () -> Unit = {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(label, color = if (selected) MaterialTheme.colorScheme.onPrimary else Color.White)
+            Text(
+                "ID ${camera.id}",
+                color = if (selected) MaterialTheme.colorScheme.onPrimary else Color.White.copy(alpha = 0.65f),
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
+    }
+
+    if (selected) {
+        Button(onClick = onClick, shape = CircleShape) { content() }
+    } else {
+        OutlinedButton(onClick = onClick, shape = CircleShape) { content() }
     }
 }
 
 @Composable
 private fun LensTestError(message: String, onBack: () -> Unit) {
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
+        modifier = Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -269,6 +289,19 @@ private fun LensTestError(message: String, onBack: () -> Unit) {
         Spacer(Modifier.height(16.dp))
         Button(onClick = onBack) { Text("Back") }
     }
+}
+
+private fun bindStatus(result: CameraBindResult?, binding: Boolean): String = when (result) {
+    is CameraBindResult.Success -> "Requested ${result.requestedCameraId} · active ${result.actualCameraId}"
+    is CameraBindResult.Failure -> "Camera ${result.cameraId} failed: ${result.reason}"
+    null -> if (binding) "Opening camera…" else "Select a camera"
+}
+
+private fun captureStatus(result: CaptureProbeResult?): String = when (result) {
+    is CaptureProbeResult.Success ->
+        "Capture OK · ID ${result.cameraId} · ${result.width}×${result.height} · format ${result.format}"
+    is CaptureProbeResult.Failure -> "Capture failed: ${result.reason}"
+    null -> "This probe keeps the captured frame in memory and does not save a photo."
 }
 
 private fun chooseDefaultRearCamera(profile: DeviceCameraProfile): CameraDescriptor? = profile.cameras
@@ -297,6 +330,8 @@ private fun selectedLensDescription(camera: CameraDescriptor): String {
         if (eq != null) append(String.format(Locale.US, " · %.1f mm eq", eq))
         if (focal != null) append(String.format(Locale.US, " · %.2f mm native", focal))
         if (camera.isLogical) append(" · logical")
-        if (camera.parentLogicalCameraIds.isNotEmpty()) append(" · member of ${camera.parentLogicalCameraIds.joinToString()}")
+        if (camera.parentLogicalCameraIds.isNotEmpty()) {
+            append(" · member of ${camera.parentLogicalCameraIds.joinToString()}")
+        }
     }
 }
