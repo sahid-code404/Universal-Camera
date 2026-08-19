@@ -28,10 +28,10 @@ import kotlinx.coroutines.withTimeout
 /**
  * Computational RAW acquisition engine.
  *
- * RAW images are paired with TotalCaptureResult by SENSOR_TIMESTAMP and staged immediately into
- * tightly packed file-backed RAW16 buffers so Camera2/ImageReader buffers are released quickly.
- * C1.5 delegates alignment and fusion to ComputationalRawMerger, which performs sparse two-stage
- * Bayer alignment, noise-aware temporal weighting and a multi-core full-resolution merge.
+ * C1.6 separates the short camera-critical acquisition stage from expensive post-processing.
+ * RAW images are timestamp-paired with TotalCaptureResult and copied into packed file-backed RAW16
+ * buffers. The camera can then resume preview immediately while alignment/fusion runs later from the
+ * scratch files. Camera2 Image objects never survive into post-processing.
  */
 class ComputationalRawEngine(
     private val cameraHandler: Handler,
@@ -67,6 +67,16 @@ class ComputationalRawEngine(
         val whiteLevel: Int,
     )
 
+    /** Opaque file-backed burst handed from the camera stage to the background processing queue. */
+    class CapturedBurst internal constructor(
+        internal val frames: List<CapturedRawFrame>,
+        internal val characteristics: CameraCharacteristics,
+    ) {
+        val width: Int get() = frames.first().width
+        val height: Int get() = frames.first().height
+        val frameCount: Int get() = frames.size
+    }
+
     private data class RawPayload(
         val timestampNs: Long,
         val width: Int,
@@ -74,7 +84,7 @@ class ComputationalRawEngine(
         val file: File,
     )
 
-    private data class CapturedRawFrame(
+    internal data class CapturedRawFrame(
         val width: Int,
         val height: Int,
         val file: File,
@@ -85,7 +95,8 @@ class ComputationalRawEngine(
         val whiteLevel: Int,
     )
 
-    suspend fun captureAndMerge(
+    /** Camera-critical stage only. No alignment or fusion happens before this returns. */
+    suspend fun captureToScratch(
         device: CameraDevice,
         session: CameraCaptureSession,
         reader: ImageReader,
@@ -96,7 +107,7 @@ class ComputationalRawEngine(
         lockedFocusDistanceDiopters: Float?,
         applyCommonSettings: (CaptureRequest.Builder) -> Unit,
         applySensorPixelMode: (CaptureRequest.Builder) -> Unit,
-    ): MergeResult {
+    ): CapturedBurst {
         require(reader.imageFormat == ImageFormat.RAW_SENSOR)
         scratchDir.mkdirs()
         val frames = captureBurst(
@@ -111,11 +122,54 @@ class ComputationalRawEngine(
             applyCommonSettings = applyCommonSettings,
             applySensorPixelMode = applySensorPixelMode,
         )
+        return CapturedBurst(frames, characteristics)
+    }
+
+    /** CPU-heavy stage. Safe to call after preview has already resumed. */
+    fun mergeCaptured(burst: CapturedBurst): MergeResult = merge(burst.frames, burst.characteristics)
+
+    /** Deletes file-backed RAW frames after save/failure/cancellation. */
+    fun discardCaptured(burst: CapturedBurst) {
+        burst.frames.forEach { runCatching { it.file.delete() } }
+    }
+
+    /** Backwards-compatible blocking path used outside the realtime C-RAW queue. */
+    suspend fun captureAndMerge(
+        device: CameraDevice,
+        session: CameraCaptureSession,
+        reader: ImageReader,
+        characteristics: CameraCharacteristics,
+        plan: BurstPlan,
+        baseIso: Int,
+        baseExposureTimeNs: Long,
+        lockedFocusDistanceDiopters: Float?,
+        applyCommonSettings: (CaptureRequest.Builder) -> Unit,
+        applySensorPixelMode: (CaptureRequest.Builder) -> Unit,
+    ): MergeResult {
+        val burst = captureToScratch(
+            device = device,
+            session = session,
+            reader = reader,
+            characteristics = characteristics,
+            plan = plan,
+            baseIso = baseIso,
+            baseExposureTimeNs = baseExposureTimeNs,
+            lockedFocusDistanceDiopters = lockedFocusDistanceDiopters,
+            applyCommonSettings = applyCommonSettings,
+            applySensorPixelMode = applySensorPixelMode,
+        )
         return try {
-            merge(frames, characteristics)
+            mergeCaptured(burst)
         } finally {
-            frames.forEach { runCatching { it.file.delete() } }
+            discardCaptured(burst)
         }
+    }
+
+    fun clearStaleScratch() {
+        scratchDir.mkdirs()
+        scratchDir.listFiles()
+            ?.filter { it.name.startsWith("omnicam_craw_") && it.name.endsWith(".raw16") }
+            ?.forEach { runCatching { it.delete() } }
     }
 
     private suspend fun captureBurst(
@@ -310,26 +364,41 @@ class ComputationalRawEngine(
                     "Unsupported RAW_SENSOR pixel stride $pixelStride"
                 }
 
-                // Most RAW_SENSOR devices use two tightly packed bytes per sample. When row padding
-                // exists we still copy complete rows in one channel write instead of per-pixel I/O.
-                val packedRow = ByteBuffer.allocateDirect(width * BYTES_PER_RAW_PIXEL)
-                    .order(ByteOrder.nativeOrder())
-                for (y in 0 until height) {
-                    val rowStart = base + y * rowStride
-                    if (pixelStride == BYTES_PER_RAW_PIXEL && rowStart + width * BYTES_PER_RAW_PIXEL <= limit) {
-                        val row = source.duplicate()
-                        row.position(rowStart)
-                        row.limit(rowStart + width * BYTES_PER_RAW_PIXEL)
-                        val slice = row.slice()
-                        while (slice.hasRemaining()) channel.write(slice)
-                    } else {
-                        packedRow.clear()
-                        for (x in 0 until width) {
-                            val offset = rowStart + x * pixelStride
-                            packedRow.putShort(if (offset + 1 < limit) source.getShort(offset) else 0)
+                val packedRowBytes = width * BYTES_PER_RAW_PIXEL
+                val packedFrameBytes = packedRowBytes.toLong() * height.toLong()
+
+                // Fast path: the common RAW_SENSOR layout is one contiguous RAW16 plane. Write the
+                // entire 24 MB-ish frame as a single buffer instead of thousands of row writes.
+                if (
+                    pixelStride == BYTES_PER_RAW_PIXEL &&
+                    rowStride == packedRowBytes &&
+                    packedFrameBytes <= Int.MAX_VALUE &&
+                    base.toLong() + packedFrameBytes <= limit.toLong()
+                ) {
+                    val packed = source.duplicate()
+                    packed.position(base)
+                    packed.limit(base + packedFrameBytes.toInt())
+                    val slice = packed.slice()
+                    while (slice.hasRemaining()) channel.write(slice)
+                } else {
+                    val packedRow = ByteBuffer.allocateDirect(packedRowBytes).order(ByteOrder.nativeOrder())
+                    for (y in 0 until height) {
+                        val rowStart = base + y * rowStride
+                        if (pixelStride == BYTES_PER_RAW_PIXEL && rowStart + packedRowBytes <= limit) {
+                            val row = source.duplicate()
+                            row.position(rowStart)
+                            row.limit(rowStart + packedRowBytes)
+                            val slice = row.slice()
+                            while (slice.hasRemaining()) channel.write(slice)
+                        } else {
+                            packedRow.clear()
+                            for (x in 0 until width) {
+                                val offset = rowStart + x * pixelStride
+                                packedRow.putShort(if (offset + 1 < limit) source.getShort(offset) else 0)
+                            }
+                            packedRow.flip()
+                            while (packedRow.hasRemaining()) channel.write(packedRow)
                         }
-                        packedRow.flip()
-                        while (packedRow.hasRemaining()) channel.write(packedRow)
                     }
                 }
             }
@@ -345,9 +414,9 @@ class ComputationalRawEngine(
         characteristics: CameraCharacteristics,
     ): MergeResult {
         require(frames.size >= MIN_BURST_FRAMES)
-        val fusion = ComputationalRawMerger.merge(
+        val fusion = RealtimeRawMerger.merge(
             frames = frames.map { frame ->
-                ComputationalRawMerger.Frame(
+                RealtimeRawMerger.Frame(
                     width = frame.width,
                     height = frame.height,
                     file = frame.file,
