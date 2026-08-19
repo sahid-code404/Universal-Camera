@@ -1,8 +1,7 @@
 package com.omnicam.camera.camerax
 
+import android.graphics.Bitmap
 import android.util.Size
-import androidx.camera.viewfinder.core.TransformationInfo
-import androidx.camera.viewfinder.core.ViewfinderSurfaceRequest
 
 /** Shared RAW types used by the single production camera. */
 enum class ComputationalRawPreset(
@@ -16,9 +15,14 @@ enum class ComputationalRawPreset(
 }
 
 data class ComputationalRawViewfinderSpec(
-    val surfaceRequest: ViewfinderSurfaceRequest,
-    val transformationInfo: TransformationInfo,
     val previewSize: Size,
+    val rotationDegrees: Int,
+    val mirrorX: Boolean,
+)
+
+data class YuvPreviewFrame(
+    val bitmap: Bitmap,
+    val timestampNanos: Long,
 )
 
 sealed interface ComputationalRawBindResult {
