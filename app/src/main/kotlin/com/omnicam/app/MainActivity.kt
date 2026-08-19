@@ -24,7 +24,7 @@ class MainActivity : ComponentActivity() {
                 OmniCamApp(
                     diagnosticsViewModel = diagnosticsViewModel,
                     scanner = container.cameraCapabilityScanner,
-                    previewController = container.cameraXPreviewController,
+                    previewController = container.camera2AuxPreviewController,
                 )
             }
         }
