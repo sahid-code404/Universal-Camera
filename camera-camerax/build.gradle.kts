@@ -36,6 +36,5 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
     implementation(libs.androidx.camera.viewfinder.core)
-    implementation(libs.androidx.heifwriter)
     implementation(libs.kotlinx.coroutines.android)
 }
