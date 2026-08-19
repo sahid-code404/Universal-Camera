@@ -12,6 +12,31 @@ fun DeviceCameraProfile.toSanitizedJson(): String {
         .put("model", model)
         .put("sdkInt", sdkInt)
         .put("scannedAtEpochMillis", scannedAtEpochMillis)
+        .put("publicExposureAssessment", publicExposureAssessment.name)
+        .put(
+            "legacyCameraApi",
+            JSONObject()
+                .put("cameraCount", legacyCameraCount)
+                .put(
+                    "cameras",
+                    JSONArray().apply {
+                        legacyCameras.forEach { camera ->
+                            put(
+                                JSONObject()
+                                    .put("index", camera.index)
+                                    .put("lensFacing", camera.lensFacing.name)
+                                    .put("orientationDegrees", camera.orientationDegrees),
+                            )
+                        }
+                    },
+                ),
+        )
+        .put(
+            "concurrentCameraIdSets",
+            JSONArray().apply {
+                concurrentCameraIdSets.forEach { ids -> put(JSONArray(ids)) }
+            },
+        )
         .put(
             "logicalGroups",
             JSONArray().apply {
