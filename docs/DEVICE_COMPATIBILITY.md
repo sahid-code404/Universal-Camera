@@ -4,7 +4,7 @@ Physical-device validation has started. Results below describe what the tested R
 
 | Device | Android | Normal OmniCam identity | Snapcam-compatible identity experiment | Logical groups | Confirmed optical finding | Known issues / next gate | Report/commit |
 |---|---:|---|---|---:|---|---|---|
-| Xiaomi POCO M2 Pro | API 36 (ROM unspecified) | `com.omnicam.app`: Camera2 IDs `0` rear WIDE (~25.6 mm eq) and `1` FRONT (~28.1 mm eq); Camera1 count 2; no logical groups | `org.codeaurora.snapcam`: **8 Camera2 IDs**, Camera1 count **6**; rear IDs include `21`, `22`, `20`, `0`, `100`, `61`; front IDs include `1`, `101` | 1 under Snapcam identity: logical `61` with physical members `0`, `20` | Camera `21` reports ~15.6 mm eq / 1.65 mm native and is classified ULTRA_WIDE with high confidence | Caller package identity demonstrably changes camera exposure on this ROM. Opening/preview/capture validation of each exposed rear ID is pending; do not yet label camera `22` as macro solely from metadata. | User tests 2026-08-19; experiment branch `experiment-snapcam-aux-identity` |
+| Xiaomi POCO M2 Pro | API 36 (ROM unspecified) | `com.omnicam.app`: Camera2 IDs `0` rear WIDE (~25.6 mm eq) and `1` FRONT (~28.1 mm eq); Camera1 count 2; no logical groups | `org.codeaurora.snapcam`: **8 Camera2 IDs**, Camera1 count **6**; rear IDs `21`, `22`, `20`, `0`, `100`, `61`; front IDs `1`, `101` | 1 under Snapcam identity: logical `61` with physical members `0`, `20` | Camera `21` reports ~15.6 mm eq / 1.65 mm native and is classified ULTRA_WIDE with high confidence | Caller package identity demonstrably changes camera exposure on this ROM. A CI-green live preview/in-memory capture APK now exists; per-ID hardware results are pending. Do not label camera `22` as macro solely from metadata. | User tests 2026-08-19; experiment branch `experiment-snapcam-aux-identity` |
 
 ## POCO M2 Pro finding
 
@@ -24,7 +24,16 @@ logical groups: 1
 
 This is strong device-level evidence that the vendor camera stack filters auxiliary-camera visibility by caller/client identity on this ROM. This finding belongs in the compatibility layer; it must not be generalized to every Qualcomm, Xiaomi, or Android device.
 
-The current next test is stricter than enumeration: bind CameraX preview and an in-memory ImageCapture probe to every exposed rear Camera2 ID. Only successful session/capture tests should promote an ID from **enumerated** to **usable**.
+The current test is stricter than enumeration: bind CameraX preview and an in-memory ImageCapture probe to every exposed rear Camera2 ID. Only successful session/capture tests should promote an ID from **enumerated** to **usable**.
+
+### IDs awaiting live validation
+
+- `21` — metadata strongly indicates ultra-wide (~15.6 mm eq).
+- `22` — ~23.1 mm eq; optical role remains unverified.
+- `20` — ~24.0 mm eq; physical member of logical camera `61`.
+- `0` — main wide (~25.6 mm eq); physical member of logical camera `61`.
+- `100` — ~25.6 mm eq; may be an alternate vendor route and must be visually/session validated.
+- `61` — logical rear camera with physical members `0` and `20`.
 
 ## Validation rules
 
