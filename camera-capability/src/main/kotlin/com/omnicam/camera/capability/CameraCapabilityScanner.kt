@@ -2,6 +2,7 @@ package com.omnicam.camera.capability
 
 import android.content.Context
 import android.graphics.ImageFormat
+import android.hardware.Camera
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
@@ -13,9 +14,11 @@ import android.util.Size
 import com.omnicam.core.model.CameraDescriptor
 import com.omnicam.core.model.DeviceCameraProfile
 import com.omnicam.core.model.FloatRange
+import com.omnicam.core.model.LegacyCameraDescriptor
 import com.omnicam.core.model.LensFacing
 import com.omnicam.core.model.LogicalCameraGroup
 import com.omnicam.core.model.OutputFormatCapability
+import com.omnicam.core.model.PublicCameraExposureAssessment
 import com.omnicam.core.model.Size2D
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -69,6 +72,15 @@ class AndroidCameraCapabilityScanner(
             }
         }
 
+        val legacyProbe = readLegacyCameraProbe()
+        val concurrentIds = readConcurrentCameraIdSets()
+        val assessment = assessPublicCameraExposure(
+            listedIds = listedIds,
+            descriptors = descriptors,
+            logicalGroups = logicalGroups,
+            legacyCameraCount = legacyProbe.count,
+        )
+
         DeviceCameraProfile(
             manufacturer = Build.MANUFACTURER.orEmpty(),
             model = Build.MODEL.orEmpty(),
@@ -76,6 +88,10 @@ class AndroidCameraCapabilityScanner(
             scannedAtEpochMillis = System.currentTimeMillis(),
             cameras = descriptors,
             logicalGroups = logicalGroups,
+            legacyCameraCount = legacyProbe.count,
+            legacyCameras = legacyProbe.cameras,
+            concurrentCameraIdSets = concurrentIds,
+            publicExposureAssessment = assessment,
         )
     }
 
@@ -171,6 +187,63 @@ class AndroidCameraCapabilityScanner(
         )
     }
 
+    @Suppress("DEPRECATION")
+    private fun readLegacyCameraProbe(): LegacyCameraProbe {
+        val count = runCatching { Camera.getNumberOfCameras() }.getOrNull() ?: return LegacyCameraProbe(null, emptyList())
+        val cameras = (0 until count).mapNotNull { index ->
+            runCatching {
+                val info = Camera.CameraInfo()
+                Camera.getCameraInfo(index, info)
+                LegacyCameraDescriptor(
+                    index = index,
+                    lensFacing = when (info.facing) {
+                        Camera.CameraInfo.CAMERA_FACING_FRONT -> LensFacing.FRONT
+                        Camera.CameraInfo.CAMERA_FACING_BACK -> LensFacing.BACK
+                        else -> LensFacing.UNKNOWN
+                    },
+                    orientationDegrees = info.orientation,
+                )
+            }.getOrNull()
+        }
+        return LegacyCameraProbe(count, cameras)
+    }
+
+    private fun readConcurrentCameraIdSets(): List<List<String>> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return emptyList()
+        return runCatching {
+            cameraManager.concurrentCameraIds
+                .map { ids -> ids.toList().sorted() }
+                .sortedBy { ids -> ids.joinToString("|") }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun assessPublicCameraExposure(
+        listedIds: List<String>,
+        descriptors: List<CameraDescriptor>,
+        logicalGroups: List<LogicalCameraGroup>,
+        legacyCameraCount: Int?,
+    ): PublicCameraExposureAssessment {
+        if (logicalGroups.isNotEmpty()) {
+            return PublicCameraExposureAssessment.LOGICAL_MULTI_CAMERA_EXPOSED
+        }
+
+        val directlyListedRear = descriptors.count { it.directlyListed && it.lensFacing == LensFacing.BACK }
+        val directlyListedFront = descriptors.count { it.directlyListed && it.lensFacing == LensFacing.FRONT }
+        if (directlyListedRear > 1 || directlyListedFront > 1) {
+            return PublicCameraExposureAssessment.MULTIPLE_CAMERA2_IDS
+        }
+
+        if (legacyCameraCount != null && legacyCameraCount > listedIds.size) {
+            return PublicCameraExposureAssessment.LEGACY_API_SEES_ADDITIONAL_CAMERAS
+        }
+
+        if (listedIds.isNotEmpty() && logicalGroups.isEmpty() && (legacyCameraCount == null || legacyCameraCount <= listedIds.size)) {
+            return PublicCameraExposureAssessment.AUXILIARY_NOT_EXPOSED_BY_STANDARD_DISCOVERY
+        }
+
+        return PublicCameraExposureAssessment.UNKNOWN
+    }
+
     private fun equivalentFocalLengthMm(focalLengthMm: Float, sensorWidthMm: Float, sensorHeightMm: Float): Float {
         val sensorDiagonal = sqrt(sensorWidthMm * sensorWidthMm + sensorHeightMm * sensorHeightMm)
         if (sensorDiagonal <= 0f) return Float.NaN
@@ -210,4 +283,9 @@ class AndroidCameraCapabilityScanner(
         ImageFormat.HEIC -> "HEIC"
         else -> "FORMAT_$format"
     }
+
+    private data class LegacyCameraProbe(
+        val count: Int?,
+        val cameras: List<LegacyCameraDescriptor>,
+    )
 }
