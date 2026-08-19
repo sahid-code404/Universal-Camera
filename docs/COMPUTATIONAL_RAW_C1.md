@@ -49,3 +49,7 @@ This is intentionally conservative. C2/C3 should add:
 ## Safety boundary
 
 The normal OmniCam photo controller is unchanged. C1 is exposed through the separate `OmniCam C-RAW Lab` launcher during hardware validation. Once C1 is stable across real devices, the computational engine can be integrated into the main Photo UI behind capability gates.
+
+## Development update/reinstall note
+
+C1 uses the same development package identity and signing key as the normal hardware-test build. A newer C1 APK can therefore be installed directly over an existing OmniCam development build without uninstalling. The `phase-2-camera-ui-updater` push workflow publishes the same built package to the `dev-latest` development update channel, so the C-RAW launcher remains part of the updated package while C1 is under validation.
