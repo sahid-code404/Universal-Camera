@@ -6,13 +6,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import com.omnicam.camera.camerax.ComputationalRawController
 import com.omnicam.feature.camera.ComputationalRawLabRoute
 
-/** Temporary secondary launcher for hardware validation of the isolated C1 RAW fusion engine. */
+/** Temporary secondary launcher for hardware validation of the isolated computational RAW engine. */
 class ComputationalRawActivity : ComponentActivity() {
-    private val controller by lazy { ComputationalRawController(applicationContext) }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -21,15 +18,10 @@ class ComputationalRawActivity : ComponentActivity() {
                 val container = (application as OmniCamApplication).appContainer
                 ComputationalRawLabRoute(
                     scanner = container.cameraCapabilityScanner,
-                    controller = controller,
+                    controller = container.computationalRawController,
                     onBack = { finish() },
                 )
             }
         }
-    }
-
-    override fun onDestroy() {
-        controller.shutdown()
-        super.onDestroy()
     }
 }
