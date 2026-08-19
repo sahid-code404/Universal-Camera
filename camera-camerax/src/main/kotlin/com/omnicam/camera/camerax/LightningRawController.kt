@@ -54,7 +54,6 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
-/** User controls that are snapshotted into each background RAW job. */
 data class LightningRawTuning(
     val denoiseStrength: Float = 0.88f,
     val highlightProtection: Float = 0.80f,
@@ -272,8 +271,6 @@ class LightningRawController(context: Context) {
                 val focus = reference.get(CaptureResult.LENS_FOCUS_DISTANCE)
                 onProgress("Capturing ${preset.frameCount} RAW")
 
-                // Intentionally do NOT stop the repeating preview. Camera2 temporarily prioritizes
-                // this high-priority burst, then resumes the existing preview request automatically.
                 val burst = engine.captureToScratch(
                     device = device,
                     session = session,
@@ -377,7 +374,7 @@ class LightningRawController(context: Context) {
                     message = when {
                         enhancedResult != null -> "Saved RAW + ${enhancedResult.width}×${enhancedResult.height} HD+"
                         enhancedError != null -> "Saved RAW · HD+ failed"
-                        else -> "Saved RAW",
+                        else -> "Saved RAW"
                     },
                     nativeFusion = fusion.native,
                     dngUri = dngUri,
