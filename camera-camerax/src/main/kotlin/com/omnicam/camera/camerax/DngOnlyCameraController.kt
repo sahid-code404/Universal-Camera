@@ -14,8 +14,8 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
-import android.media.DngCreator
 import android.media.ExifInterface
 import android.media.ImageReader
 import android.net.Uri
@@ -41,7 +41,6 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
 import kotlin.math.max
-import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -271,7 +270,7 @@ class DngOnlyCameraController(context: Context) {
         if (!captureMutex.tryLock()) return DngCaptureResult.Failure("RAW capture already running")
         try {
             if (activeJobCount() >= MAX_PENDING_JOBS) return DngCaptureResult.Failure("Processing queue full")
-            val route = activeRoute ?: return DngCaptureResult.Failure("Camera not ready")
+            activeRoute ?: return DngCaptureResult.Failure("Camera not ready")
             val device = cameraDevice ?: return DngCaptureResult.Failure("Camera unavailable")
             val chars = activeCharacteristics ?: return DngCaptureResult.Failure("Camera metadata unavailable")
             val surface = previewSurface ?: return DngCaptureResult.Failure("Preview unavailable")
@@ -306,7 +305,6 @@ class DngOnlyCameraController(context: Context) {
                         builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
                         builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE)
                         setLensShadingMapIfSupported(builder, chars)
-                        applyZoom(builder, chars, zoomSnapshot)
                     },
                     applySensorPixelMode = { builder ->
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
