@@ -30,6 +30,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,6 +50,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.omnicam.camera.camerax.ComputationalRawBindResult
 import com.omnicam.camera.camerax.ComputationalRawCaptureResult
 import com.omnicam.camera.camerax.ComputationalRawController
+import com.omnicam.camera.camerax.ComputationalRawJobStage
+import com.omnicam.camera.camerax.ComputationalRawJobStatus
 import com.omnicam.camera.camerax.ComputationalRawPreset
 import com.omnicam.camera.camerax.ComputationalRawViewfinderSpec
 import com.omnicam.camera.capability.CameraCapabilityScanner
@@ -70,6 +73,10 @@ fun ComputationalRawLabRoute(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
+    val jobs by controller.jobs.collectAsState()
+    val activeJobs = jobs.filterNot { it.terminal }
+    val queueFull = activeJobs.size >= 3
+
     var permissionGranted by remember { mutableStateOf(hasCameraPermission(context)) }
     var routes by remember { mutableStateOf<List<ValuableCameraRoute>>(emptyList()) }
     var selectedId by remember { mutableStateOf<String?>(null) }
@@ -78,7 +85,7 @@ fun ComputationalRawLabRoute(
     var bindResult by remember { mutableStateOf<ComputationalRawBindResult?>(null) }
     var preset by remember { mutableStateOf(ComputationalRawPreset.MAX) }
     var capturing by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf("DNG-only C-RAW ready") }
+    var progress by remember { mutableStateOf("C1.6 realtime DNG ready") }
     var result by remember { mutableStateOf<ComputationalRawCaptureResult?>(null) }
     var latestUri by remember { mutableStateOf<Uri?>(null) }
     var lifecycleResumed by remember {
@@ -130,6 +137,18 @@ fun ComputationalRawLabRoute(
             .onFailure { scanError = it.message ?: it::class.java.simpleName }
     }
 
+    LaunchedEffect(jobs) {
+        val saved = jobs.firstOrNull { it.stage == ComputationalRawJobStage.SAVED && it.uri != null }
+        if (saved?.uri != null) latestUri = saved.uri
+        if (!capturing) {
+            val current = jobs.firstOrNull { !it.terminal }
+            when {
+                current != null -> progress = current.message + " · shutter ready"
+                saved != null -> progress = "Saved ${saved.preset.name} DNG · shutter ready"
+            }
+        }
+    }
+
     val selected = routes.firstOrNull { it.camera.id == selectedId }
 
     LaunchedEffect(selected?.camera?.id, lifecycleResumed) {
@@ -179,12 +198,12 @@ fun ComputationalRawLabRoute(
                     TextButton(onClick = onBack) { Text("Back", color = Color.White) }
                     Column(Modifier.weight(1f)) {
                         Text(
-                            "OmniCam Computational RAW · DNG",
+                            "OmniCam Computational RAW · C1.6",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                         )
                         Text(
-                            "RAW burst → timestamp sync → align → motion reject → Bayer fusion → DNG",
+                            "RAW burst → preview resumes → background align/denoise/fuse → DNG",
                             color = Color.White.copy(alpha = 0.65f),
                             style = MaterialTheme.typography.bodySmall,
                         )
@@ -252,11 +271,11 @@ fun ComputationalRawLabRoute(
                         items(routes, key = { it.camera.id }) { route ->
                             val selectedLens = route.camera.id == selectedId
                             if (selectedLens) {
-                                Button(onClick = { selectedId = route.camera.id }) {
+                                Button(onClick = { selectedId = route.camera.id }, enabled = !capturing) {
                                     Text(crawLensLabel(route))
                                 }
                             } else {
-                                TextButton(onClick = { selectedId = route.camera.id }) {
+                                TextButton(onClick = { selectedId = route.camera.id }, enabled = !capturing) {
                                     Text(crawLensLabel(route), color = Color.White)
                                 }
                             }
@@ -291,8 +310,10 @@ fun ComputationalRawLabRoute(
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp),
                     )
 
+                    BackgroundRawJobs(jobs)
+
                     Button(
-                        enabled = !capturing && bindResult is ComputationalRawBindResult.Success,
+                        enabled = !capturing && !queueFull && bindResult is ComputationalRawBindResult.Success,
                         onClick = {
                             if (capturing) return@Button
                             capturing = true
@@ -300,11 +321,11 @@ fun ComputationalRawLabRoute(
                             scope.launch {
                                 val captured = controller.capture(preset) { progress = it }
                                 result = captured
-                                if (captured is ComputationalRawCaptureResult.Success) {
-                                    latestUri = captured.uri
-                                    progress = "Saved merged computational DNG"
-                                } else if (captured is ComputationalRawCaptureResult.Failure) {
-                                    progress = captured.message
+                                when (captured) {
+                                    is ComputationalRawCaptureResult.Queued -> {
+                                        progress = "Burst #${captured.jobId} queued · processing in background · shutter ready"
+                                    }
+                                    is ComputationalRawCaptureResult.Failure -> progress = captured.message
                                 }
                                 capturing = false
                             }
@@ -313,7 +334,9 @@ fun ComputationalRawLabRoute(
                         if (capturing) {
                             CircularProgressIndicator(Modifier.height(22.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.padding(horizontal = 5.dp))
-                            Text("Capturing + fusing RAW…")
+                            Text("Capturing RAW burst…")
+                        } else if (queueFull) {
+                            Text("Background queue full")
                         } else {
                             Text("Capture ${preset.frameCount}-frame C-RAW")
                         }
@@ -322,19 +345,55 @@ fun ComputationalRawLabRoute(
                     CrawResult(result)
                     latestUri?.let {
                         Text(
-                            "Saved DNG to DCIM/OmniCam/C-RAW",
+                            "Latest saved DNG: DCIM/OmniCam/C-RAW",
                             color = Color.White.copy(alpha = 0.55f),
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
                     Text(
-                        "DNG-only mode: HEIF rendering is disabled. QUALITY/HDR/MAX still capture and fuse 6/8/12 RAW frames; only the merged Bayer DNG is written.",
+                        "Realtime DNG-only mode: the shutter is held only during RAW acquisition. Alignment, temporal denoise, Bayer fusion and DNG writing continue in a low-priority background queue while preview and the next capture stay available.",
                         color = Color.White.copy(alpha = 0.55f),
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(horizontal = 18.dp, vertical = 7.dp),
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun BackgroundRawJobs(jobs: List<ComputationalRawJobStatus>) {
+    val active = jobs.filterNot { it.terminal }
+    val latest = jobs.firstOrNull { it.terminal }
+    if (active.isEmpty() && latest == null) return
+
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        if (active.isNotEmpty()) {
+            val processing = active.count { it.stage == ComputationalRawJobStage.PROCESSING || it.stage == ComputationalRawJobStage.SAVING }
+            val queued = active.count { it.stage == ComputationalRawJobStage.QUEUED }
+            Text(
+                "Background: $processing processing · $queued queued · preview/shutter live",
+                color = Color.White.copy(alpha = 0.82f),
+                style = MaterialTheme.typography.labelMedium,
+            )
+            active.take(2).forEach { job ->
+                Text(
+                    "#${job.id} ${job.preset.name} · ${job.stage.name.lowercase()} · ${job.message}",
+                    color = Color.White.copy(alpha = 0.58f),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+        if (latest != null && latest.stage == ComputationalRawJobStage.FAILED) {
+            Text(
+                "Background job #${latest.id} failed: ${latest.message}",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }
@@ -348,33 +407,25 @@ private fun CrawResult(result: ComputationalRawCaptureResult?) {
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.padding(8.dp),
         )
-        is ComputationalRawCaptureResult.Success -> {
-            val total = result.acceptedSamples + result.rejectedSamples
-            val acceptedPercent = if (total > 0L) result.acceptedSamples * 100.0 / total else 0.0
-            val moves = result.alignments.joinToString(" ") {
-                "(${it.dx},${it.dy};${String.format(Locale.US, "%.2f", it.confidence)})"
-            }
-            Text(
-                buildString {
-                    append("Saved DNG ")
-                    append(result.width)
-                    append('×')
-                    append(result.height)
-                    append(" · ")
-                    append(result.frameCount)
-                    append(" RAW · ")
-                    append(String.format(Locale.US, "%.1f%%", acceptedPercent))
-                    append(" merge samples · ")
-                    append(String.format(Locale.US, "%.1fs", result.elapsedMillis / 1000.0))
-                    if (result.maximumResolutionMode) append(" · max sensor mode")
-                    append("\nAlignment dx/dy/conf: ")
-                    append(moves)
-                },
-                color = Color.White.copy(alpha = 0.78f),
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
-            )
-        }
+        is ComputationalRawCaptureResult.Queued -> Text(
+            buildString {
+                append("Captured ")
+                append(result.width)
+                append('×')
+                append(result.height)
+                append(" · ")
+                append(result.frameCount)
+                append(" RAW · burst ")
+                append(String.format(Locale.US, "%.1fs", result.captureElapsedMillis / 1000.0))
+                append(" · job #")
+                append(result.jobId)
+                append(" now processing in background")
+                if (result.maximumResolutionMode) append(" · max sensor mode")
+            },
+            color = Color.White.copy(alpha = 0.78f),
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+        )
         null -> Unit
     }
 }
