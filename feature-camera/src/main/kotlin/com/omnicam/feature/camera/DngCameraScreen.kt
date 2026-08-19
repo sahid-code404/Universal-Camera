@@ -413,9 +413,11 @@ fun DngCameraRoute(
                         onDenoise = { denoise = it },
                         upscale = upscale,
                         onUpscale = { value ->
-                            val id = selectedId ?: return@DngControlSheet
-                            upscale = value
-                            store.setUpscale(id, value)
+                            val id = selectedId
+                            if (id != null) {
+                                upscale = value
+                                store.setUpscale(id, value)
+                            }
                         },
                         lensLabel = selected?.let { zoomLabel((routeEq(it) / baseEq).coerceAtLeast(0.1f)) }.orEmpty(),
                         onClose = { showControls = false },
@@ -568,10 +570,11 @@ private fun RoundIcon(
     text: String,
     active: Boolean,
     enabled: Boolean = true,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     Surface(
-        modifier = Modifier.size(46.dp).clickable(enabled = enabled, onClick = onClick),
+        modifier = modifier.size(46.dp).clickable(enabled = enabled, onClick = onClick),
         shape = CircleShape,
         color = if (active) Color.White.copy(alpha = 0.90f) else Color.Black.copy(alpha = 0.46f),
     ) {
@@ -622,15 +625,16 @@ private fun ModeLabel(label: String, selected: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun GalleryButton(photo: DngLastPhoto?, onClick: () -> Unit) {
+    val bitmap = photo?.bitmap
     Surface(
         modifier = Modifier.size(52.dp).clickable(enabled = photo != null, onClick = onClick),
         shape = CircleShape,
         color = Color(0xFF252527),
         border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
     ) {
-        if (photo?.bitmap != null) {
+        if (bitmap != null) {
             Image(
-                bitmap = photo.bitmap.asImageBitmap(),
+                bitmap = bitmap.asImageBitmap(),
                 contentDescription = "Open last DNG",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
@@ -674,6 +678,7 @@ private fun RawViewer(photo: DngLastPhoto, onClose: () -> Unit) {
             RoundIcon(
                 text = "×",
                 active = false,
+                modifier = Modifier.align(Alignment.TopEnd).padding(top = 34.dp, end = 16.dp),
                 onClick = onClose,
             )
             Column(
