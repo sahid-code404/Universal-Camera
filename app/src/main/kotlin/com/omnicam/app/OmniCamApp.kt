@@ -9,6 +9,7 @@ import com.omnicam.camera.capability.CameraCapabilityScanner
 import com.omnicam.feature.camera.CameraDiagnosticsRoute
 import com.omnicam.feature.camera.CameraDiagnosticsViewModel
 import com.omnicam.feature.camera.CameraLensTestRoute
+import com.omnicam.feature.camera.LensPreferencesStore
 
 private object Routes {
     const val Diagnostics = "diagnostics"
@@ -20,6 +21,7 @@ fun OmniCamApp(
     diagnosticsViewModel: CameraDiagnosticsViewModel,
     scanner: CameraCapabilityScanner,
     previewController: Camera2AuxPreviewController,
+    lensPreferencesStore: LensPreferencesStore,
 ) {
     val navController = rememberNavController()
 
@@ -37,6 +39,7 @@ fun OmniCamApp(
             CameraLensTestRoute(
                 scanner = scanner,
                 previewController = previewController,
+                preferencesStore = lensPreferencesStore,
                 onBack = { navController.popBackStack() },
             )
         }

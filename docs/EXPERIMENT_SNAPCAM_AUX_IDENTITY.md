@@ -2,38 +2,48 @@
 
 This branch is a temporary diagnostic experiment. It must not be merged into OmniCam production as-is.
 
-## Hypothesis
+## Confirmed device result
 
-Some legacy Qualcomm/Xiaomi camera provider configurations expose auxiliary cameras only to allowlisted client package identities. `org.codeaurora.snapcam` is commonly present in such vendor allowlists on affected device families.
+On the tested Xiaomi POCO M2 Pro, changing the client application identity from `com.omnicam.app` to `org.codeaurora.snapcam` changed Camera2 exposure from two IDs to eight IDs. That confirms package-sensitive vendor camera exposure on this device/ROM.
 
-The normal OmniCam package identity (`com.omnicam.app`) saw only two camera devices on the tested POCO M2 Pro: rear main and front.
+The additional Camera2 graph contains both useful physical photographic routes and non-user-facing routes such as a logical aggregator and metadata-duplicate aliases. Raw Camera2 ID count therefore must never be treated as physical lens count.
 
-## Experiment
+## Generalized useful-lens resolver
 
-This branch changes only the installed application identity to:
+The experiment now uses `ValuableCameraResolver` instead of a POCO camera-ID table.
 
-```text
-org.codeaurora.snapcam
-```
+The resolver:
 
-The Kotlin namespace and classes remain OmniCam's own code. The manifest uses fully-qualified component class names so changing the application ID does not change class resolution.
+- excludes logical aggregate camera IDs from the normal lens bar,
+- excludes depth-only/non-photographic routes,
+- retains directly listed photographic Camera2 devices,
+- understands physical cameras that must later be routed through a logical camera,
+- collapses strong optical-metadata duplicates as vendor aliases,
+- prefers direct/member routes over duplicate aliases,
+- sorts default rear lenses from wider to longer focal length,
+- never relies on hard-coded IDs such as `21`, `22`, `20`, or `0`.
 
-The diagnostics additionally record:
+This makes the lens-resolution logic applicable to other Snapdragon/vendor camera graphs when those routes are exposed to the app. It does **not** guarantee that every Snapdragon ROM uses the same package allowlist or exposes all sensors.
 
-- actual client package name,
-- Camera2 enumeration,
-- Camera1 enumeration,
-- logical/physical Camera2 membership,
-- concurrent camera sets,
-- a bounded numeric Camera2-characteristics probe for IDs 0 through 9 that are not enumerated.
+## User lens layout
 
-The numeric probe does **not** open any camera. A readable characteristic set is not treated as proof that an unlisted ID is independently openable.
+The useful rear-lens list now has persistent user configuration:
 
-## Interpretation
+- enable/disable each useful lens,
+- reorder lenses,
+- reset to capability-derived defaults.
 
-If this build sees more cameras than `com.omnicam.app` on the same ROM, client package filtering is confirmed for that device/ROM.
+Preferences are stored with AndroidX DataStore. Raw logical/alias IDs remain visible only in diagnostics for debugging.
 
-If this build still sees only the same cameras, package-name allowlisting alone is insufficient and the auxiliary sensors may require additional OEM/system privileges or another vendor-specific path.
+## Routing boundary
+
+Three concepts remain separate:
+
+1. a Camera2 ID is enumerated,
+2. the resolver considers it a useful photographic route,
+3. a preview/capture session actually succeeds.
+
+The current hardware probe directly opens `DIRECT_CAMERA_DEVICE` routes through Camera2. `PHYSICAL_VIA_LOGICAL` routing remains a later session-level implementation task for devices that expose physical members only behind a logical camera.
 
 ## Installation conflict
 

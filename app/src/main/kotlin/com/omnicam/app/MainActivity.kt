@@ -25,6 +25,7 @@ class MainActivity : ComponentActivity() {
                     diagnosticsViewModel = diagnosticsViewModel,
                     scanner = container.cameraCapabilityScanner,
                     previewController = container.camera2AuxPreviewController,
+                    lensPreferencesStore = container.lensPreferencesStore,
                 )
             }
         }
