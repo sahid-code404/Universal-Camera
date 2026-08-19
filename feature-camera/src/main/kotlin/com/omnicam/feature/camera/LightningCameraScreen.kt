@@ -3,9 +3,12 @@ package com.omnicam.feature.camera
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.ImageDecoder
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.viewfinder.compose.Viewfinder
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,6 +19,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -37,13 +42,16 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -69,12 +77,22 @@ import com.omnicam.camera.capability.ValuableCameraRoute
 import com.omnicam.core.model.LensFacing
 import com.omnicam.core.model.LensRole
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 private val CameraYellow = Color(0xFFFFD60A)
 
-private enum class TunePanel { NONE, HIGHLIGHT, DENOISE }
+private enum class TunePanel { NONE, HIGHLIGHT, DENOISE, UPSCALE, ASPECT }
+private enum class PhotoAspect(val label: String, val sensorRatio: Float?) {
+    FOUR_THREE("4:3", 4f / 3f),
+    SIXTEEN_NINE("16:9", 16f / 9f),
+    SQUARE("1:1", 1f),
+    FULL("FULL", null),
+}
 
 @Composable
 fun LightningCameraRoute(
@@ -101,10 +119,16 @@ fun LightningCameraRoute(
     var status by remember { mutableStateOf("Ready") }
     var highlight by remember { mutableFloatStateOf(0.80f) }
     var denoise by remember { mutableFloatStateOf(0.88f) }
-    var hdPlus by remember { mutableStateOf(true) }
+    var aspect by remember { mutableStateOf(PhotoAspect.FOUR_THREE) }
     var tunePanel by remember { mutableStateOf(TunePanel.NONE) }
+    var viewerUri by remember { mutableStateOf<Uri?>(null) }
     var lifecycleResumed by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+    }
+
+    val lensPrefs = remember { context.getSharedPreferences("omnicam_lens_upscale", Context.MODE_PRIVATE) }
+    var upscale by remember(selectedId) {
+        mutableFloatStateOf(selectedId?.let { lensPrefs.getFloat("factor_$it", 1f) } ?: 1f)
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -123,9 +147,7 @@ fun LightningCameraRoute(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(Unit) {
-        if (!permissionGranted) permissionLauncher.launch(Manifest.permission.CAMERA)
-    }
+    LaunchedEffect(Unit) { if (!permissionGranted) permissionLauncher.launch(Manifest.permission.CAMERA) }
 
     LaunchedEffect(permissionGranted) {
         if (!permissionGranted) return@LaunchedEffect
@@ -153,11 +175,12 @@ fun LightningCameraRoute(
     val baseEq = baseRoute?.let(::routeEq)?.takeIf { it.isFinite() && it > 0f } ?: 26f
     val selectedFactor = selected?.let { (routeEq(it) / baseEq).coerceAtLeast(0.1f) } ?: 1f
     val overallZoom = selectedFactor * cameraState.zoomRatio
+    val lastSaved = jobs.firstOrNull { it.stage == LightningJobStage.SAVED && it.dngUri != null }
 
-    LaunchedEffect(selected?.camera?.id, lifecycleResumed) {
+    LaunchedEffect(selected?.camera?.id, lifecycleResumed, aspect) {
         controller.unbind()
         bindResult = null
-        if (!lifecycleResumed) {
+        if (!lifecycleResumed || viewerUri != null) {
             spec = null
             return@LaunchedEffect
         }
@@ -166,10 +189,18 @@ fun LightningCameraRoute(
             return@LaunchedEffect
         }
         spec = runCatching {
-            controller.createViewfinderSpec(route, "${route.camera.id}-${System.nanoTime()}")
+            controller.createViewfinderSpec(
+                route = route,
+                targetAspect = aspect.sensorRatio,
+                sessionKey = "${route.camera.id}-${aspect.name}-${System.nanoTime()}",
+            )
         }.onFailure {
             bindResult = ComputationalRawBindResult.Failure(route.camera.id, it.message ?: "Camera unavailable")
         }.getOrNull()
+    }
+
+    LaunchedEffect(viewerUri) {
+        if (viewerUri != null) controller.unbind()
     }
 
     LaunchedEffect(jobs, capturing) {
@@ -178,264 +209,336 @@ fun LightningCameraRoute(
         val saved = jobs.firstOrNull { it.stage == LightningJobStage.SAVED }
         status = when {
             active != null -> "Processing ${jobs.count { !it.terminal }}"
-            saved?.enhancedUri != null -> "Saved RAW + HD+"
-            saved != null -> "Saved RAW"
+            saved != null -> saved.message
             else -> "Ready"
         }
     }
 
-    DisposableEffect(Unit) {
-        onDispose { controller.unbind() }
-    }
+    DisposableEffect(Unit) { onDispose { controller.unbind() } }
 
     Surface(modifier.fillMaxSize(), color = Color.Black) {
         when {
+            viewerUri != null -> DngViewer(uri = viewerUri!!, onClose = { viewerUri = null })
             !permissionGranted -> CenterMessage("Camera access needed", "Allow camera permission to use OmniCam.") {
                 permissionLauncher.launch(Manifest.permission.CAMERA)
             }
             scanError != null -> CenterMessage("Camera unavailable", scanError.orEmpty())
             routes.isEmpty() -> CenterMessage("RAW unavailable", "No useful direct RAW_SENSOR camera is exposed on this device.")
-            else -> Box(Modifier.fillMaxSize().background(Color.Black)) {
-                val currentSpec = spec
-                val currentRoute = selected
-                if (currentSpec != null && currentRoute != null && lifecycleResumed) {
-                    Viewfinder(
-                        surfaceRequest = currentSpec.surfaceRequest,
-                        transformationInfo = currentSpec.transformationInfo,
-                        alignment = Alignment.Center,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .pointerInput(cameraState.maxZoomRatio, selectedId) {
-                                detectTransformGestures { _, _, gestureZoom, _ ->
-                                    val current = controller.cameraState.value.zoomRatio
-                                    controller.setZoomRatio(current * gestureZoom)
-                                }
-                            },
-                    ) {
-                        onSurfaceSession {
-                            bindResult = controller.bind(surface, currentSpec, currentRoute)
-                            try {
-                                awaitCancellation()
-                            } finally {
-                                controller.unbind()
-                            }
-                        }
-                    }
-                } else {
-                    CircularProgressIndicator(Modifier.align(Alignment.Center), color = Color.White)
-                }
-
+            else -> Column(Modifier.fillMaxSize().background(Color.Black)) {
                 Box(
                     Modifier
                         .fillMaxWidth()
-                        .height(190.dp)
-                        .align(Alignment.TopCenter)
-                        .background(
-                            Brush.verticalGradient(
-                                listOf(Color.Black.copy(alpha = 0.82f), Color.Black.copy(alpha = 0.26f), Color.Transparent),
-                            ),
-                        ),
-                )
-
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.TopCenter)
-                        .padding(top = 34.dp, start = 14.dp, end = 14.dp),
+                        .weight(1f)
+                        .background(Color.Black),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        TinyChip("RAW", active = true, onClick = {})
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            TinyChip("HL ${(highlight * 100).roundToInt()}", tunePanel == TunePanel.HIGHLIGHT) {
-                                tunePanel = if (tunePanel == TunePanel.HIGHLIGHT) TunePanel.NONE else TunePanel.HIGHLIGHT
-                            }
-                            TinyChip("NR ${(denoise * 100).roundToInt()}", tunePanel == TunePanel.DENOISE) {
-                                tunePanel = if (tunePanel == TunePanel.DENOISE) TunePanel.NONE else TunePanel.DENOISE
-                            }
-                            TinyChip("HD+", hdPlus) { hdPlus = !hdPlus }
-                        }
+                    val currentSpec = spec
+                    val currentRoute = selected
+                    val previewModifier = when (aspect) {
+                        PhotoAspect.FULL -> Modifier.fillMaxSize()
+                        else -> Modifier.fillMaxWidth().aspectRatio(1f / (aspect.sensorRatio ?: 4f / 3f))
                     }
-                    if (tunePanel != TunePanel.NONE) {
-                        Surface(
-                            Modifier.fillMaxWidth().padding(top = 10.dp),
-                            shape = RoundedCornerShape(22.dp),
-                            color = Color.Black.copy(alpha = 0.66f),
+                    Box(previewModifier.background(Color.Black), contentAlignment = Alignment.Center) {
+                        if (currentSpec != null && currentRoute != null && lifecycleResumed) {
+                            Viewfinder(
+                                surfaceRequest = currentSpec.surfaceRequest,
+                                transformationInfo = currentSpec.transformationInfo,
+                                alignment = Alignment.Center,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .pointerInput(cameraState.maxZoomRatio, selectedId) {
+                                        detectTransformGestures { _, _, gestureZoom, _ ->
+                                            controller.setZoomRatio(controller.cameraState.value.zoomRatio * gestureZoom)
+                                        }
+                                    },
+                            ) {
+                                onSurfaceSession {
+                                    bindResult = controller.bind(surface, currentSpec, currentRoute)
+                                    try { awaitCancellation() } finally { controller.unbind() }
+                                }
+                            }
+                            RuleOfThirdsGrid(Modifier.fillMaxSize())
+                        } else {
+                            CircularProgressIndicator(color = Color.White)
+                        }
+
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .align(Alignment.TopCenter)
+                                .padding(top = 14.dp, start = 12.dp, end = 12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Column(Modifier.padding(horizontal = 18.dp, vertical = 8.dp)) {
-                                val isHighlight = tunePanel == TunePanel.HIGHLIGHT
-                                Text(
-                                    if (isHighlight) "Highlight protection" else "RAW denoise",
-                                    color = Color.White,
-                                    fontSize = 12.sp,
-                                )
-                                Slider(
-                                    value = if (isHighlight) highlight else denoise,
-                                    onValueChange = { if (isHighlight) highlight = it else denoise = it },
-                                    valueRange = if (isHighlight) 0f..1f else 0.50f..1f,
-                                )
+                            GlassChip("DNG") { }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                GlassChip("HL") { tunePanel = toggle(tunePanel, TunePanel.HIGHLIGHT) }
+                                GlassChip("NR") { tunePanel = toggle(tunePanel, TunePanel.DENOISE) }
+                                GlassChip("•••") { tunePanel = toggle(tunePanel, TunePanel.ASPECT) }
                             }
                         }
-                    }
-                }
 
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.BottomCenter)
-                        .background(
-                            Brush.verticalGradient(
-                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.72f), Color.Black),
-                            ),
-                        )
-                        .padding(top = 84.dp, bottom = 24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text(
-                        String.format(Locale.US, "%.1f×", overallZoom),
-                        color = CameraYellow,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 14.sp,
-                    )
-
-                    Row(
-                        Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        sameFacing.forEach { route ->
-                            val factor = (routeEq(route) / baseEq).coerceAtLeast(0.1f)
-                            LensBubble(
-                                label = zoomLabel(factor),
-                                selected = route.camera.id == selectedId,
-                                onClick = { if (!capturing) selectedId = route.camera.id },
+                        if (tunePanel != TunePanel.NONE) {
+                            TuneSheet(
+                                panel = tunePanel,
+                                highlight = highlight,
+                                denoise = denoise,
+                                upscale = upscale,
+                                aspect = aspect,
+                                onHighlight = { highlight = it },
+                                onDenoise = { denoise = it },
+                                onUpscale = {
+                                    upscale = it
+                                    selectedId?.let { id -> lensPrefs.edit().putFloat("factor_$id", it).apply() }
+                                },
+                                onAspect = {
+                                    aspect = it
+                                    tunePanel = TunePanel.NONE
+                                },
+                                onOpenUpscale = { tunePanel = TunePanel.UPSCALE },
+                                modifier = Modifier.align(Alignment.BottomCenter).padding(14.dp),
                             )
                         }
                     }
-
-                    if (cameraState.maxZoomRatio > cameraState.minZoomRatio + 0.02f) {
-                        Slider(
-                            value = cameraState.zoomRatio.coerceIn(cameraState.minZoomRatio, cameraState.maxZoomRatio),
-                            onValueChange = { controller.setZoomRatio(it) },
-                            valueRange = cameraState.minZoomRatio..cameraState.maxZoomRatio,
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 48.dp).height(28.dp),
-                        )
-                    } else {
-                        Spacer(Modifier.height(28.dp))
-                    }
-
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 58.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        ModeLabel("RAW", preset == ComputationalRawPreset.QUALITY) { if (!capturing) preset = ComputationalRawPreset.QUALITY }
-                        ModeLabel("HDR", preset == ComputationalRawPreset.HDR) { if (!capturing) preset = ComputationalRawPreset.HDR }
-                        ModeLabel("MAX", preset == ComputationalRawPreset.MAX) { if (!capturing) preset = ComputationalRawPreset.MAX }
-                    }
-
-                    Text(
-                        if (queueFull) "Processing queue full" else status,
-                        color = Color.White.copy(alpha = 0.72f),
-                        fontSize = 12.sp,
-                        modifier = Modifier.padding(top = 2.dp, bottom = 8.dp),
-                    )
-
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 28.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Surface(
-                            Modifier.size(50.dp),
-                            shape = RoundedCornerShape(13.dp),
-                            color = Color(0xFF242424),
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Text("▣", color = Color.White, fontSize = 22.sp)
-                            }
-                        }
-
-                        ShutterButton(
-                            enabled = !capturing && !queueFull && bindResult is ComputationalRawBindResult.Success,
-                            capturing = capturing,
-                        ) {
-                            if (capturing || queueFull) return@ShutterButton
-                            capturing = true
-                            status = "Capturing"
-                            scope.launch {
-                                val result = controller.capture(
-                                    preset = preset,
-                                    tuning = LightningRawTuning(
-                                        denoiseStrength = denoise,
-                                        highlightProtection = highlight,
-                                        enhancedUpscale = hdPlus,
-                                    ),
-                                ) { status = it }
-                                status = when (result) {
-                                    is LightningCaptureResult.Queued -> "Processing in background"
-                                    is LightningCaptureResult.Failure -> result.message
-                                }
-                                capturing = false
-                            }
-                        }
-
-                        val opposite = if (selected?.camera?.lensFacing == LensFacing.FRONT) LensFacing.BACK else LensFacing.FRONT
-                        val canFlip = routes.any { it.camera.lensFacing == opposite }
-                        Surface(
-                            Modifier
-                                .size(50.dp)
-                                .clickable(enabled = canFlip && !capturing) {
-                                    val next = chooseWide(routes.filter { it.camera.lensFacing == opposite })
-                                    if (next != null) selectedId = next.camera.id
-                                },
-                            shape = CircleShape,
-                            color = Color(0xAA2C2C2E),
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Text("↻", color = if (canFlip) Color.White else Color.Gray, fontSize = 24.sp)
-                            }
-                        }
-                    }
                 }
+
+                CameraControls(
+                    sameFacing = sameFacing,
+                    selectedId = selectedId,
+                    baseEq = baseEq,
+                    overallZoom = overallZoom,
+                    cameraStateZoom = cameraState.zoomRatio,
+                    minZoom = cameraState.minZoomRatio,
+                    maxZoom = cameraState.maxZoomRatio,
+                    preset = preset,
+                    capturing = capturing,
+                    queueFull = queueFull,
+                    status = status,
+                    upscale = upscale,
+                    aspect = aspect,
+                    lastUri = lastSaved?.dngUri,
+                    onLens = { id -> if (!capturing) selectedId = id },
+                    onZoom = controller::setZoomRatio,
+                    onPreset = { if (!capturing) preset = it },
+                    onGallery = { lastSaved?.dngUri?.let { viewerUri = it } },
+                    onAspect = { tunePanel = toggle(tunePanel, TunePanel.ASPECT) },
+                    onUpscale = { tunePanel = toggle(tunePanel, TunePanel.UPSCALE) },
+                    onFlip = {
+                        val opposite = if (selected?.camera?.lensFacing == LensFacing.FRONT) LensFacing.BACK else LensFacing.FRONT
+                        chooseWide(routes.filter { it.camera.lensFacing == opposite })?.let { selectedId = it.camera.id }
+                    },
+                    canFlip = routes.any { it.camera.lensFacing != selected?.camera?.lensFacing },
+                    onCapture = {
+                        if (capturing || queueFull) return@CameraControls
+                        capturing = true
+                        status = "Capturing"
+                        scope.launch {
+                            val result = controller.capture(
+                                preset = preset,
+                                tuning = LightningRawTuning(
+                                    denoiseStrength = denoise,
+                                    highlightProtection = highlight,
+                                    upscaleFactor = upscale,
+                                    aspectRatio = aspect.sensorRatio,
+                                ),
+                            ) { status = it }
+                            status = when (result) {
+                                is LightningCaptureResult.Queued -> "DNG processing"
+                                is LightningCaptureResult.Failure -> result.message
+                            }
+                            capturing = false
+                        }
+                    },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun TinyChip(text: String, active: Boolean, onClick: () -> Unit) {
+private fun CameraControls(
+    sameFacing: List<ValuableCameraRoute>,
+    selectedId: String?,
+    baseEq: Float,
+    overallZoom: Float,
+    cameraStateZoom: Float,
+    minZoom: Float,
+    maxZoom: Float,
+    preset: ComputationalRawPreset,
+    capturing: Boolean,
+    queueFull: Boolean,
+    status: String,
+    upscale: Float,
+    aspect: PhotoAspect,
+    lastUri: Uri?,
+    onLens: (String) -> Unit,
+    onZoom: (Float) -> Unit,
+    onPreset: (ComputationalRawPreset) -> Unit,
+    onGallery: () -> Unit,
+    onAspect: () -> Unit,
+    onUpscale: () -> Unit,
+    onFlip: () -> Unit,
+    canFlip: Boolean,
+    onCapture: () -> Unit,
+) {
+    Column(
+        Modifier.fillMaxWidth().background(Color.Black).padding(top = 10.dp, bottom = 18.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Row(
+            Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            sameFacing.forEach { route ->
+                val factor = (routeEq(route) / baseEq).coerceAtLeast(0.1f)
+                LensBubble(zoomLabel(factor), route.camera.id == selectedId) { onLens(route.camera.id) }
+            }
+        }
+        Text(
+            String.format(Locale.US, "%.1f×", overallZoom),
+            color = CameraYellow,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(top = 3.dp),
+        )
+
+        if (maxZoom > minZoom + 0.02f) {
+            Slider(
+                value = cameraStateZoom.coerceIn(minZoom, maxZoom),
+                onValueChange = onZoom,
+                valueRange = minZoom..maxZoom,
+                modifier = Modifier.fillMaxWidth().height(28.dp).padding(horizontal = 54.dp),
+            )
+        } else Spacer(Modifier.height(28.dp))
+
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 52.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            ModeLabel("RAW", preset == ComputationalRawPreset.QUALITY) { onPreset(ComputationalRawPreset.QUALITY) }
+            ModeLabel("HDR", preset == ComputationalRawPreset.HDR) { onPreset(ComputationalRawPreset.HDR) }
+            ModeLabel("MAX", preset == ComputationalRawPreset.MAX) { onPreset(ComputationalRawPreset.MAX) }
+        }
+
+        Text(
+            if (queueFull) "Processing queue full" else status,
+            color = Color.White.copy(alpha = 0.66f),
+            fontSize = 11.sp,
+            modifier = Modifier.padding(vertical = 5.dp),
+        )
+
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 28.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            GalleryButton(lastUri, onGallery)
+            ShutterButton(!capturing && !queueFull, capturing, onCapture)
+            RoundTextButton("↻", canFlip && !capturing, onFlip)
+        }
+
+        Row(
+            Modifier.fillMaxWidth().padding(top = 10.dp, start = 44.dp, end = 44.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            BottomOption(aspect.label, onAspect)
+            BottomOption("DNG", {})
+            BottomOption(String.format(Locale.US, "UP %.1f×", upscale), onUpscale)
+        }
+    }
+}
+
+@Composable
+private fun TuneSheet(
+    panel: TunePanel,
+    highlight: Float,
+    denoise: Float,
+    upscale: Float,
+    aspect: PhotoAspect,
+    onHighlight: (Float) -> Unit,
+    onDenoise: (Float) -> Unit,
+    onUpscale: (Float) -> Unit,
+    onAspect: (PhotoAspect) -> Unit,
+    onOpenUpscale: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(28.dp),
+        color = Color(0xE62B2B2D),
+    ) {
+        when (panel) {
+            TunePanel.HIGHLIGHT -> SliderSheet("HIGHLIGHT", highlight, 0f..1f, onHighlight)
+            TunePanel.DENOISE -> SliderSheet("DENOISE", denoise, 0.35f..1f, onDenoise)
+            TunePanel.UPSCALE -> SliderSheet("DNG UPSCALE  ${String.format(Locale.US, "%.1f×", upscale)}", upscale, 1f..2f, onUpscale)
+            TunePanel.ASPECT -> Column(Modifier.padding(18.dp)) {
+                Text("CAMERA CONTROLS", color = Color.White.copy(alpha = 0.55f), fontSize = 11.sp)
+                Row(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    PhotoAspect.entries.forEach { choice ->
+                        ControlTile(choice.label, choice == aspect) { onAspect(choice) }
+                    }
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalArrangement = Arrangement.Center) {
+                    ControlTile("UPSCALE", false, onOpenUpscale)
+                }
+            }
+            TunePanel.NONE -> Unit
+        }
+    }
+}
+
+@Composable
+private fun SliderSheet(label: String, value: Float, range: ClosedFloatingPointRange<Float>, onValue: (Float) -> Unit) {
+    Column(Modifier.padding(horizontal = 20.dp, vertical = 14.dp)) {
+        Text(label, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        Slider(value = value, onValueChange = onValue, valueRange = range)
+    }
+}
+
+@Composable
+private fun ControlTile(label: String, selected: Boolean, onClick: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable(onClick = onClick)) {
+        Surface(
+            modifier = Modifier.size(54.dp),
+            shape = CircleShape,
+            color = if (selected) Color.White.copy(alpha = 0.22f) else Color.Black.copy(alpha = 0.28f),
+        ) { Box(contentAlignment = Alignment.Center) { Text(label.take(2), color = Color.White, fontWeight = FontWeight.Bold) } }
+        Text(label, color = Color.White.copy(alpha = 0.75f), fontSize = 9.sp, modifier = Modifier.padding(top = 5.dp))
+    }
+}
+
+@Composable
+private fun RuleOfThirdsGrid(modifier: Modifier = Modifier) {
+    androidx.compose.foundation.Canvas(modifier) {
+        val paint = Color.White.copy(alpha = 0.22f)
+        val stroke = 1.dp.toPx()
+        drawLine(paint, start = androidx.compose.ui.geometry.Offset(size.width / 3f, 0f), end = androidx.compose.ui.geometry.Offset(size.width / 3f, size.height), strokeWidth = stroke)
+        drawLine(paint, start = androidx.compose.ui.geometry.Offset(size.width * 2f / 3f, 0f), end = androidx.compose.ui.geometry.Offset(size.width * 2f / 3f, size.height), strokeWidth = stroke)
+        drawLine(paint, start = androidx.compose.ui.geometry.Offset(0f, size.height / 3f), end = androidx.compose.ui.geometry.Offset(size.width, size.height / 3f), strokeWidth = stroke)
+        drawLine(paint, start = androidx.compose.ui.geometry.Offset(0f, size.height * 2f / 3f), end = androidx.compose.ui.geometry.Offset(size.width, size.height * 2f / 3f), strokeWidth = stroke)
+    }
+}
+
+@Composable
+private fun GlassChip(text: String, onClick: () -> Unit) {
     Surface(
         modifier = Modifier.clickable(onClick = onClick),
         shape = CircleShape,
-        color = if (active) Color.White.copy(alpha = 0.92f) else Color.Black.copy(alpha = 0.48f),
-    ) {
-        Text(
-            text,
-            color = if (active) Color.Black else Color.White,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-        )
-    }
+        color = Color.Black.copy(alpha = 0.46f),
+    ) { Text(text, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp)) }
 }
 
 @Composable
 private fun LensBubble(label: String, selected: Boolean, onClick: () -> Unit) {
     Surface(
-        modifier = Modifier.size(if (selected) 48.dp else 42.dp).clickable(onClick = onClick),
+        modifier = Modifier.size(if (selected) 42.dp else 34.dp).clickable(onClick = onClick),
         shape = CircleShape,
-        color = if (selected) Color.White.copy(alpha = 0.90f) else Color.Black.copy(alpha = 0.58f),
+        color = if (selected) Color(0xFF2C2C2E) else Color.Transparent,
     ) {
         Box(contentAlignment = Alignment.Center) {
-            Text(
-                label,
-                color = if (selected) Color.Black else Color.White,
-                fontSize = if (selected) 13.sp else 12.sp,
-                fontWeight = FontWeight.SemiBold,
-            )
+            Text(label, color = if (selected) CameraYellow else Color.White.copy(alpha = 0.75f), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
@@ -444,10 +547,10 @@ private fun LensBubble(label: String, selected: Boolean, onClick: () -> Unit) {
 private fun ModeLabel(label: String, selected: Boolean, onClick: () -> Unit) {
     Text(
         label,
-        color = if (selected) CameraYellow else Color.White.copy(alpha = 0.82f),
-        fontSize = 13.sp,
+        color = if (selected) CameraYellow else Color.White.copy(alpha = 0.78f),
+        fontSize = 12.sp,
         fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-        modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 8.dp, vertical = 6.dp),
+        modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 8.dp, vertical = 5.dp),
     )
 }
 
@@ -455,14 +558,81 @@ private fun ModeLabel(label: String, selected: Boolean, onClick: () -> Unit) {
 private fun ShutterButton(enabled: Boolean, capturing: Boolean, onClick: () -> Unit) {
     Box(
         Modifier
-            .size(82.dp)
+            .size(78.dp)
             .border(4.dp, if (enabled) Color.White else Color.Gray, CircleShape)
             .padding(6.dp)
-            .background(if (capturing) Color(0xFFB0B0B0) else Color.White, CircleShape)
+            .background(if (capturing) Color.LightGray else Color.White, CircleShape)
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        if (capturing) CircularProgressIndicator(Modifier.size(28.dp), color = Color.Black, strokeWidth = 2.dp)
+        if (capturing) CircularProgressIndicator(Modifier.size(26.dp), color = Color.Black, strokeWidth = 2.dp)
+    }
+}
+
+@Composable
+private fun GalleryButton(uri: Uri?, onClick: () -> Unit) {
+    val bitmap by rememberDngBitmap(uri, 256)
+    Surface(
+        modifier = Modifier.size(50.dp).clickable(enabled = uri != null, onClick = onClick),
+        shape = CircleShape,
+        color = Color(0xFF252525),
+    ) {
+        if (bitmap != null) {
+            Image(bitmap!!, contentDescription = "Last DNG", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        } else {
+            Box(contentAlignment = Alignment.Center) { Text("▣", color = Color.White, fontSize = 20.sp) }
+        }
+    }
+}
+
+@Composable
+private fun RoundTextButton(text: String, enabled: Boolean, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier.size(50.dp).clickable(enabled = enabled, onClick = onClick),
+        shape = CircleShape,
+        color = Color(0xFF252525),
+    ) { Box(contentAlignment = Alignment.Center) { Text(text, color = if (enabled) Color.White else Color.Gray, fontSize = 23.sp) } }
+}
+
+@Composable
+private fun BottomOption(text: String, onClick: () -> Unit) {
+    Text(text, color = Color.White.copy(alpha = 0.62f), fontSize = 10.sp, modifier = Modifier.clickable(onClick = onClick).padding(5.dp))
+}
+
+@Composable
+private fun DngViewer(uri: Uri, onClose: () -> Unit) {
+    val bitmap by rememberDngBitmap(uri, 2200)
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        if (bitmap != null) {
+            Image(bitmap!!, contentDescription = "DNG photo", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+        } else {
+            CircularProgressIndicator(Modifier.align(Alignment.Center), color = Color.White)
+        }
+        Surface(
+            modifier = Modifier.align(Alignment.TopStart).padding(18.dp).size(44.dp).clickable(onClick = onClose),
+            shape = CircleShape,
+            color = Color.Black.copy(alpha = 0.55f),
+        ) { Box(contentAlignment = Alignment.Center) { Text("‹", color = Color.White, fontSize = 34.sp) } }
+        Text("DNG", color = Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.align(Alignment.TopCenter).padding(top = 28.dp))
+    }
+}
+
+@Composable
+private fun rememberDngBitmap(uri: Uri?, maxSide: Int) = produceState<ImageBitmap?>(initialValue = null, uri, maxSide) {
+    value = if (uri == null) null else withContext(Dispatchers.IO) {
+        runCatching {
+            val source = ImageDecoder.createSource(LocalContext.current.contentResolver, uri)
+            ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                val width = info.size.width
+                val height = info.size.height
+                val longest = maxOf(width, height)
+                if (longest > maxSide) {
+                    val scale = maxSide.toFloat() / longest
+                    decoder.setTargetSize((width * scale).roundToInt().coerceAtLeast(1), (height * scale).roundToInt().coerceAtLeast(1))
+                }
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            }.asImageBitmap()
+        }.getOrNull()
     }
 }
 
@@ -485,11 +655,13 @@ private fun CenterMessage(title: String, message: String, action: (() -> Unit)? 
     }
 }
 
+private fun toggle(current: TunePanel, requested: TunePanel): TunePanel = if (current == requested) TunePanel.NONE else requested
+
 private fun chooseWide(routes: List<ValuableCameraRoute>): ValuableCameraRoute? {
     val back = routes.filter { it.camera.lensFacing == LensFacing.BACK }
     val pool = if (back.isNotEmpty()) back else routes
     return pool.firstOrNull { it.camera.classification.role == LensRole.WIDE }
-        ?: pool.minByOrNull { kotlin.math.abs(routeEq(it) - 26f) }
+        ?: pool.minByOrNull { abs(routeEq(it) - 26f) }
 }
 
 private fun routeEq(route: ValuableCameraRoute): Float =
@@ -498,9 +670,9 @@ private fun routeEq(route: ValuableCameraRoute): Float =
         ?: 26f
 
 private fun zoomLabel(value: Float): String = when {
-    kotlin.math.abs(value - 1f) < 0.06f -> "1×"
+    abs(value - 1f) < 0.06f -> "1×"
     value < 1f -> String.format(Locale.US, "%.1f×", value)
-    kotlin.math.abs(value - value.roundToInt()) < 0.08f -> "${value.roundToInt()}×"
+    abs(value - value.roundToInt()) < 0.08f -> "${value.roundToInt()}×"
     else -> String.format(Locale.US, "%.1f×", value)
 }
 
