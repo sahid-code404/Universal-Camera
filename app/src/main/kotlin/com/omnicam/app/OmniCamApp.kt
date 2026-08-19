@@ -4,7 +4,7 @@ import androidx.compose.runtime.Composable
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import com.omnicam.camera.camerax.CameraXPreviewController
+import com.omnicam.camera.camerax.Camera2AuxPreviewController
 import com.omnicam.camera.capability.CameraCapabilityScanner
 import com.omnicam.feature.camera.CameraDiagnosticsRoute
 import com.omnicam.feature.camera.CameraDiagnosticsViewModel
@@ -19,7 +19,7 @@ private object Routes {
 fun OmniCamApp(
     diagnosticsViewModel: CameraDiagnosticsViewModel,
     scanner: CameraCapabilityScanner,
-    previewController: CameraXPreviewController,
+    previewController: Camera2AuxPreviewController,
 ) {
     val navController = rememberNavController()
 
