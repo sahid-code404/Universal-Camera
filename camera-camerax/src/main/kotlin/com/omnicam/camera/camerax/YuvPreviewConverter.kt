@@ -17,14 +17,17 @@ internal object YuvPreviewConverter {
         val yBuffer = yPlane.buffer
         val uBuffer = uPlane.buffer
         val vBuffer = vPlane.buffer
+        val yBase = yBuffer.position()
+        val uBase = uBuffer.position()
+        val vBase = vBuffer.position()
         val pixels = IntArray(width * height)
 
         for (row in 0 until height) {
             val sourceY = crop.top + row
             val uvY = sourceY / 2
-            val yRow = sourceY * yPlane.rowStride
-            val uRow = uvY * uPlane.rowStride
-            val vRow = uvY * vPlane.rowStride
+            val yRow = yBase + sourceY * yPlane.rowStride
+            val uRow = uBase + uvY * uPlane.rowStride
+            val vRow = vBase + uvY * vPlane.rowStride
             for (col in 0 until width) {
                 val sourceX = crop.left + col
                 val uvX = sourceX / 2
