@@ -29,7 +29,6 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -102,47 +101,44 @@ fun UniversalCameraRoute(
     val scope = rememberCoroutineScope()
     val haptics = LocalHapticFeedback.current
     val textureView = remember(context) { TextureView(context) }
-    val preferences by preferencesStore.preferences.collectAsStateWithLifecycle(
-        initialValue = LensPreferences(),
-    )
+    val preferences by preferencesStore.preferences.collectAsStateWithLifecycle(LensPreferences())
 
     var permissionsGranted by remember { mutableStateOf(cameraPermissionsGranted(context)) }
     var profile by remember { mutableStateOf<DeviceCameraProfile?>(null) }
     var scanError by remember { mutableStateOf<String?>(null) }
-    var selectedFacing by remember { mutableStateOf(LensFacing.BACK) }
-    var selectedCameraId by remember { mutableStateOf<String?>(null) }
-    var aspectRatio by remember { mutableStateOf(PhotoAspectRatio.FOUR_THREE) }
-    var flashMode by remember { mutableStateOf(CameraFlashMode.OFF) }
-    var zoomRatio by remember { mutableFloatStateOf(1f) }
+    var facing by remember { mutableStateOf(LensFacing.BACK) }
+    var selectedId by remember { mutableStateOf<String?>(null) }
+    var aspect by remember { mutableStateOf(PhotoAspectRatio.FOUR_THREE) }
+    var flash by remember { mutableStateOf(CameraFlashMode.OFF) }
+    var zoom by remember { mutableFloatStateOf(1f) }
     var minZoom by remember { mutableFloatStateOf(1f) }
     var maxZoom by remember { mutableFloatStateOf(1f) }
-    var exposureComp by remember { mutableFloatStateOf(0f) }
+    var exposure by remember { mutableFloatStateOf(0f) }
     var bindResult by remember { mutableStateOf<CameraBindResult?>(null) }
     var captureResult by remember { mutableStateOf<PhotoCaptureResult?>(null) }
     var capturing by remember { mutableStateOf(false) }
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
-    var showSettings by remember { mutableStateOf(false) }
-    var showLensManager by remember { mutableStateOf(false) }
-    var latestPhotoUri by remember { mutableStateOf<Uri?>(null) }
+    var latestPhoto by remember { mutableStateOf<Uri?>(null) }
+    var settingsOpen by remember { mutableStateOf(false) }
+    var lensManagerOpen by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
-    ) { grants ->
+    ) { result ->
         permissionsGranted = requiredCameraPermissions().all { permission ->
-            grants[permission] == true ||
-                ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+            result[permission] == true || ContextCompat.checkSelfPermission(
+                context,
+                permission,
+            ) == PackageManager.PERMISSION_GRANTED
         }
     }
 
     LaunchedEffect(Unit) {
-        if (!permissionsGranted) {
-            permissionLauncher.launch(requiredCameraPermissions())
-        }
+        if (!permissionsGranted) permissionLauncher.launch(requiredCameraPermissions())
     }
 
     LaunchedEffect(permissionsGranted) {
         if (!permissionsGranted) return@LaunchedEffect
-        scanError = null
         runCatching { scanner.scan() }
             .onSuccess { profile = it }
             .onFailure { scanError = it.message ?: it::class.java.simpleName }
@@ -150,87 +146,77 @@ fun UniversalCameraRoute(
 
     val resolution = remember(profile) { profile?.let(ValuableCameraResolver::resolve) }
     val allRoutes = resolution?.valuableRoutes.orEmpty()
-    val facingRoutes = remember(allRoutes, preferences, selectedFacing) {
-        preferences
-            .applyOrder(allRoutes.filter { it.camera.lensFacing == selectedFacing }, selectedFacing)
-            .filter { preferences.isEnabled(it.camera.id) }
+    val visibleRoutes = remember(allRoutes, preferences, facing) {
+        preferences.applyOrder(
+            routes = allRoutes.filter { it.camera.lensFacing == facing },
+            facing = facing,
+        ).filter { preferences.isEnabled(it.camera.id) }
     }
 
-    LaunchedEffect(facingRoutes, selectedFacing) {
-        val visibleIds = facingRoutes.mapTo(mutableSetOf()) { it.camera.id }
-        if (selectedCameraId !in visibleIds) {
-            selectedCameraId = chooseDefaultRoute(facingRoutes)?.camera?.id
+    LaunchedEffect(visibleRoutes, facing) {
+        if (selectedId !in visibleRoutes.map { it.camera.id }) {
+            selectedId = chooseDefaultRoute(visibleRoutes)?.camera?.id
         }
     }
 
-    val selectedRoute = facingRoutes.firstOrNull { it.camera.id == selectedCameraId }
+    val selectedRoute = visibleRoutes.firstOrNull { it.camera.id == selectedId }
 
-    LaunchedEffect(selectedRoute, aspectRatio) {
+    LaunchedEffect(selectedRoute, aspect) {
         val route = selectedRoute ?: run {
             controller.unbind()
             bindResult = null
             return@LaunchedEffect
         }
-
-        zoomRatio = 1f
-        exposureComp = 0f
-        controller.setFlashMode(flashMode)
-        bindResult = controller.bind(textureView, route, aspectRatio)
-        val success = bindResult as? CameraBindResult.Success
-        if (success != null) {
+        zoom = 1f
+        exposure = 0f
+        controller.setFlashMode(flash)
+        bindResult = controller.bind(textureView, route, aspect)
+        (bindResult as? CameraBindResult.Success)?.let { success ->
             minZoom = success.minZoomRatio
             maxZoom = success.maxZoomRatio
-            zoomRatio = 1f.coerceIn(minZoom, maxZoom)
-            controller.setZoomRatio(zoomRatio)
+            zoom = 1f.coerceIn(minZoom, maxZoom)
+            controller.setZoomRatio(zoom)
         }
     }
 
-    LaunchedEffect(flashMode) {
-        controller.setFlashMode(flashMode)
-    }
-
+    LaunchedEffect(flash) { controller.setFlashMode(flash) }
     LaunchedEffect(focusPoint) {
         if (focusPoint != null) {
-            delay(1_100)
+            delay(1_000)
             focusPoint = null
         }
     }
+    DisposableEffect(Unit) { onDispose { controller.unbind() } }
 
-    DisposableEffect(Unit) {
-        onDispose { controller.unbind() }
-    }
-
-    Surface(modifier = modifier.fillMaxSize(), color = Color.Black) {
+    Surface(modifier.fillMaxSize(), color = Color.Black) {
         when {
-            !permissionsGranted -> CameraPermissionScreen(
-                onGrant = { permissionLauncher.launch(requiredCameraPermissions()) },
+            !permissionsGranted -> CenterMessage(
+                title = "OmniCam",
+                message = "Camera permission is required for live preview and photo capture.",
+                action = "Allow camera",
+                onAction = { permissionLauncher.launch(requiredCameraPermissions()) },
             )
-
-            scanError != null -> CameraErrorScreen(scanError.orEmpty())
-
+            scanError != null -> CenterMessage("Camera unavailable", scanError.orEmpty())
             profile == null || resolution == null -> Box(
-                modifier = Modifier.fillMaxSize(),
+                Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
-            ) {
-                CircularProgressIndicator()
-            }
-
-            else -> CameraContent(
+            ) { CircularProgressIndicator() }
+            else -> CameraView(
                 textureView = textureView,
-                selectedRoute = selectedRoute,
-                routes = facingRoutes,
-                selectedFacing = selectedFacing,
-                aspectRatio = aspectRatio,
-                flashMode = flashMode,
-                zoomRatio = zoomRatio,
+                route = selectedRoute,
+                routes = visibleRoutes,
+                facing = facing,
+                aspect = aspect,
+                flash = flash,
+                zoom = zoom,
                 minZoom = minZoom,
                 maxZoom = maxZoom,
-                exposureComp = exposureComp,
+                exposure = exposure,
                 bindResult = bindResult,
                 captureResult = captureResult,
                 capturing = capturing,
                 focusPoint = focusPoint,
-                latestPhotoUri = latestPhotoUri,
+                latestPhoto = latestPhoto,
                 onTapFocus = { point, width, height ->
                     focusPoint = point
                     if (width > 0f && height > 0f) {
@@ -238,35 +224,29 @@ fun UniversalCameraRoute(
                     }
                 },
                 onZoom = { requested ->
-                    val next = requested.coerceIn(minZoom, maxZoom)
-                    zoomRatio = next
-                    controller.setZoomRatio(next)
+                    zoom = requested.coerceIn(minZoom, maxZoom)
+                    controller.setZoomRatio(zoom)
                 },
-                onExposure = { requested ->
-                    exposureComp = requested
-                    controller.setExposureCompensation(requested.roundToInt())
+                onExposure = { value ->
+                    exposure = value
+                    controller.setExposureCompensation(value.roundToInt())
                 },
                 onFlash = {
-                    flashMode = nextFlashMode(
-                        current = flashMode,
-                        supported = selectedRoute?.camera?.flashAvailable == true,
-                    )
+                    flash = nextFlashMode(flash, selectedRoute?.camera?.flashAvailable == true)
                 },
-                onAspectRatio = {
-                    aspectRatio = if (aspectRatio == PhotoAspectRatio.FOUR_THREE) {
+                onAspect = {
+                    aspect = if (aspect == PhotoAspectRatio.FOUR_THREE) {
                         PhotoAspectRatio.SIXTEEN_NINE
-                    } else {
-                        PhotoAspectRatio.FOUR_THREE
-                    }
+                    } else PhotoAspectRatio.FOUR_THREE
                 },
-                onSettings = { showSettings = true },
-                onSelectLens = { selectedCameraId = it },
+                onSettings = { settingsOpen = true },
+                onSelectLens = { selectedId = it },
                 onFlip = {
-                    val target = if (selectedFacing == LensFacing.BACK) LensFacing.FRONT else LensFacing.BACK
+                    val target = if (facing == LensFacing.BACK) LensFacing.FRONT else LensFacing.BACK
                     if (allRoutes.any { it.camera.lensFacing == target && preferences.isEnabled(it.camera.id) }) {
-                        selectedFacing = target
-                        selectedCameraId = null
-                        flashMode = CameraFlashMode.OFF
+                        facing = target
+                        selectedId = null
+                        flash = CameraFlashMode.OFF
                     }
                 },
                 onCapture = {
@@ -277,8 +257,7 @@ fun UniversalCameraRoute(
                         )
                         scope.launch {
                             captureResult = controller.capturePhoto(displayRotationDegrees(textureView))
-                            val success = captureResult as? PhotoCaptureResult.Success
-                            if (success != null) latestPhotoUri = success.uri
+                            (captureResult as? PhotoCaptureResult.Success)?.let { latestPhoto = it.uri }
                             capturing = false
                         }
                     }
@@ -287,40 +266,40 @@ fun UniversalCameraRoute(
         }
     }
 
-    if (showSettings) {
-        CameraSettingsSheet(
-            onDismiss = { showSettings = false },
-            onManageLenses = {
-                showSettings = false
-                showLensManager = true
+    if (settingsOpen) {
+        SettingsSheet(
+            onDismiss = { settingsOpen = false },
+            onLenses = {
+                settingsOpen = false
+                lensManagerOpen = true
             },
             onDiagnostics = {
-                showSettings = false
+                settingsOpen = false
                 onOpenDiagnostics()
             },
         )
     }
 
-    if (showLensManager && resolution != null) {
-        CameraLensManagerSheet(
+    if (lensManagerOpen && resolution != null) {
+        LensManagerSheet(
             routes = resolution.valuableRoutes,
             preferences = preferences,
-            onDismiss = { showLensManager = false },
-            onToggle = { cameraId, enabled ->
-                scope.launch { preferencesStore.setEnabled(cameraId, enabled) }
-            },
-            onMove = { facing, cameraId, delta ->
-                val faceRoutes = preferences.applyOrder(
-                    resolution.valuableRoutes.filter { it.camera.lensFacing == facing },
-                    facing,
+            onDismiss = { lensManagerOpen = false },
+            onToggle = { id, enabled -> scope.launch { preferencesStore.setEnabled(id, enabled) } },
+            onMove = { face, id, delta ->
+                val ordered = preferences.applyOrder(
+                    resolution.valuableRoutes.filter { it.camera.lensFacing == face },
+                    face,
                 )
-                val ids = faceRoutes.map { it.camera.id }.toMutableList()
-                val from = ids.indexOf(cameraId)
-                val to = (from + delta).coerceIn(0, ids.lastIndex)
-                if (from >= 0 && from != to) {
-                    ids.removeAt(from)
-                    ids.add(to, cameraId)
-                    scope.launch { preferencesStore.setOrder(facing, ids) }
+                val ids = ordered.map { it.camera.id }.toMutableList()
+                val from = ids.indexOf(id)
+                if (from >= 0) {
+                    val to = (from + delta).coerceIn(0, ids.lastIndex)
+                    if (to != from) {
+                        ids.removeAt(from)
+                        ids.add(to, id)
+                        scope.launch { preferencesStore.setOrder(face, ids) }
+                    }
                 }
             },
             onReset = { scope.launch { preferencesStore.reset() } },
@@ -329,110 +308,80 @@ fun UniversalCameraRoute(
 }
 
 @Composable
-private fun CameraContent(
+private fun CameraView(
     textureView: TextureView,
-    selectedRoute: ValuableCameraRoute?,
+    route: ValuableCameraRoute?,
     routes: List<ValuableCameraRoute>,
-    selectedFacing: LensFacing,
-    aspectRatio: PhotoAspectRatio,
-    flashMode: CameraFlashMode,
-    zoomRatio: Float,
+    facing: LensFacing,
+    aspect: PhotoAspectRatio,
+    flash: CameraFlashMode,
+    zoom: Float,
     minZoom: Float,
     maxZoom: Float,
-    exposureComp: Float,
+    exposure: Float,
     bindResult: CameraBindResult?,
     captureResult: PhotoCaptureResult?,
     capturing: Boolean,
     focusPoint: Offset?,
-    latestPhotoUri: Uri?,
+    latestPhoto: Uri?,
     onTapFocus: (Offset, Float, Float) -> Unit,
     onZoom: (Float) -> Unit,
     onExposure: (Float) -> Unit,
     onFlash: () -> Unit,
-    onAspectRatio: () -> Unit,
+    onAspect: () -> Unit,
     onSettings: () -> Unit,
     onSelectLens: (String) -> Unit,
     onFlip: () -> Unit,
     onCapture: () -> Unit,
 ) {
     val mainEq = chooseDefaultRoute(routes)?.camera?.equivalentFocalLengthsMm?.minOrNull()
-    val exposureRange = selectedRoute?.camera?.aeCompensationRange ?: 0..0
+    val exposureRange = route?.camera?.aeCompensationRange ?: 0..0
 
-    Box(Modifier.fillMaxSize().background(Color.Black)) {
+    Box(Modifier.fillMaxSize()) {
         AndroidView(
             factory = { textureView },
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(selectedRoute?.camera?.id, zoomRatio) {
-                    detectTransformGestures { _, _, gestureZoom, _ ->
-                        if (gestureZoom != 1f) onZoom(zoomRatio * gestureZoom)
+                .pointerInput(route?.camera?.id, zoom) {
+                    detectTransformGestures { _, _, scale, _ ->
+                        if (scale != 1f) onZoom(zoom * scale)
                     }
                 }
-                .pointerInput(selectedRoute?.camera?.id) {
-                    detectTapGestures { offset ->
-                        onTapFocus(offset, size.width.toFloat(), size.height.toFloat())
+                .pointerInput(route?.camera?.id) {
+                    detectTapGestures { point ->
+                        onTapFocus(point, size.width.toFloat(), size.height.toFloat())
                     }
                 },
-        )
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(126.dp)
-                .align(Alignment.TopCenter)
-                .background(Color.Black.copy(alpha = 0.32f)),
         )
 
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
-                .padding(top = 42.dp, start = 14.dp, end = 14.dp),
+                .background(Color.Black.copy(alpha = 0.38f))
+                .padding(top = 38.dp, start = 8.dp, end = 8.dp, bottom = 8.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
         ) {
-            CameraTextControl(
-                text = if (selectedRoute?.camera?.flashAvailable == true) {
-                    flashLabel(flashMode)
-                } else {
-                    "Flash --"
-                },
-                enabled = selectedRoute?.camera?.flashAvailable == true,
-                onClick = onFlash,
+            TopControl(
+                if (route?.camera?.flashAvailable == true) flashLabel(flash) else "Flash --",
+                route?.camera?.flashAvailable == true,
+                onFlash,
             )
-            CameraTextControl(
-                text = if (aspectRatio == PhotoAspectRatio.FOUR_THREE) "4:3" else "16:9",
-                onClick = onAspectRatio,
-            )
-            CameraTextControl(text = "Settings", onClick = onSettings)
+            TopControl(if (aspect == PhotoAspectRatio.FOUR_THREE) "4:3" else "16:9", true, onAspect)
+            TopControl("Settings", true, onSettings)
         }
 
-        bindStatusText(bindResult)?.let { status ->
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 88.dp),
-                shape = RoundedCornerShape(18.dp),
-                color = Color.Black.copy(alpha = 0.58f),
-            ) {
-                Text(
-                    text = status,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelSmall,
-                )
-            }
+        (bindResult as? CameraBindResult.Failure)?.let { failure ->
+            StatusPill(
+                text = "Lens ${failure.cameraId}: ${failure.reason}",
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 94.dp),
+            )
         }
 
         focusPoint?.let { point ->
             Surface(
                 modifier = Modifier
-                    .offset {
-                        IntOffset(
-                            x = (point.x - 28).roundToInt(),
-                            y = (point.y - 28).roundToInt(),
-                        )
-                    }
+                    .offset { IntOffset((point.x - 28).roundToInt(), (point.y - 28).roundToInt()) }
                     .size(56.dp),
                 shape = RoundedCornerShape(8.dp),
                 color = Color.Transparent,
@@ -444,18 +393,14 @@ private fun CameraContent(
             Column(
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
-                    .padding(end = 8.dp)
-                    .background(Color.Black.copy(alpha = 0.38f), RoundedCornerShape(18.dp))
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                    .padding(end = 6.dp)
+                    .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(18.dp))
+                    .padding(6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Text(
-                    text = "EV ${exposureComp.roundToInt()}",
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelSmall,
-                )
+                Text("EV ${exposure.roundToInt()}", color = Color.White, style = MaterialTheme.typography.labelSmall)
                 Slider(
-                    value = exposureComp,
+                    value = exposure,
                     onValueChange = onExposure,
                     valueRange = exposureRange.first.toFloat()..exposureRange.last.toFloat(),
                     steps = (exposureRange.last - exposureRange.first - 1).coerceAtLeast(0),
@@ -468,48 +413,39 @@ private fun CameraContent(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color.Black.copy(alpha = 0.84f))
-                .padding(top = 10.dp, bottom = 22.dp),
+                .background(Color.Black.copy(alpha = 0.86f))
+                .padding(top = 8.dp, bottom = 22.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (routes.isNotEmpty()) {
-                LazyRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    contentPadding = PaddingValues(horizontal = 12.dp),
-                ) {
-                    items(routes, key = { it.camera.id }) { route ->
-                        LensPill(
-                            text = lensLabel(route, mainEq),
-                            selected = route.camera.id == selectedRoute?.camera?.id,
-                            onClick = { onSelectLens(route.camera.id) },
-                        )
-                    }
+            LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                contentPadding = PaddingValues(horizontal = 12.dp),
+            ) {
+                items(routes, key = { it.camera.id }) { item ->
+                    LensPill(
+                        label = lensLabel(item, mainEq),
+                        selected = item.camera.id == route?.camera?.id,
+                        onClick = { onSelectLens(item.camera.id) },
+                    )
                 }
             }
 
             Text(
-                text = if (zoomRatio > 1.02f) {
-                    String.format(Locale.US, "%.1fx", zoomRatio)
-                } else {
-                    "PHOTO"
-                },
+                if (zoom > 1.02f) String.format(Locale.US, "%.1fx", zoom) else "PHOTO",
                 color = Color.White.copy(alpha = 0.82f),
                 style = MaterialTheme.typography.labelLarge,
-                modifier = Modifier.padding(vertical = 7.dp),
+                modifier = Modifier.padding(vertical = 6.dp),
             )
 
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 28.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 28.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                LatestPhotoThumbnail(latestPhotoUri)
-
+                LatestThumbnail(latestPhoto)
                 Surface(
-                    modifier = Modifier.size(78.dp),
+                    modifier = Modifier.size(76.dp),
                     shape = CircleShape,
                     color = Color.White,
                     border = BorderStroke(2.dp, Color.LightGray),
@@ -518,10 +454,7 @@ private fun CameraContent(
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         if (capturing) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(30.dp),
-                                color = Color.Black,
-                            )
+                            CircularProgressIndicator(Modifier.size(30.dp), color = Color.Black)
                         } else {
                             Surface(
                                 modifier = Modifier.size(62.dp),
@@ -532,42 +465,34 @@ private fun CameraContent(
                         }
                     }
                 }
-
                 Surface(
                     modifier = Modifier.size(50.dp),
                     shape = CircleShape,
-                    color = Color.Black.copy(alpha = 0.68f),
+                    color = Color.Black.copy(alpha = 0.7f),
                     border = BorderStroke(1.dp, Color.DarkGray),
                     onClick = onFlip,
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        Text(
-                            text = if (selectedFacing == LensFacing.BACK) "Front" else "Rear",
-                            color = Color.White,
-                            style = MaterialTheme.typography.labelSmall,
-                        )
+                        Text(if (facing == LensFacing.BACK) "Front" else "Rear", color = Color.White, style = MaterialTheme.typography.labelSmall)
                     }
                 }
             }
 
-            when (captureResult) {
-                is PhotoCaptureResult.Failure -> Text(
-                    text = captureResult.message,
+            if (captureResult is PhotoCaptureResult.Failure) {
+                Text(
+                    captureResult.message,
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 6.dp, start = 16.dp, end = 16.dp),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp),
                 )
-                else -> Unit
             }
 
             if (maxZoom > minZoom + 0.01f) {
                 Slider(
-                    value = zoomRatio.coerceIn(minZoom, maxZoom),
+                    value = zoom.coerceIn(minZoom, maxZoom),
                     onValueChange = onZoom,
                     valueRange = minZoom..maxZoom,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 40.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 40.dp),
                 )
             }
         }
@@ -575,119 +500,67 @@ private fun CameraContent(
 }
 
 @Composable
-private fun LatestPhotoThumbnail(uri: Uri?) {
+private fun LatestThumbnail(uri: Uri?) {
     val context = LocalContext.current
     var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
-
     LaunchedEffect(uri) {
-        bitmap = if (uri == null) {
-            null
-        } else {
-            withContext(Dispatchers.IO) {
-                runCatching {
-                    context.contentResolver.openInputStream(uri)?.use(BitmapFactory::decodeStream)
-                }.getOrNull()
-            }
+        bitmap = if (uri == null) null else withContext(Dispatchers.IO) {
+            runCatching {
+                context.contentResolver.openInputStream(uri)?.use { input -> BitmapFactory.decodeStream(input) }
+            }.getOrNull()
         }
     }
-
-    Surface(
-        modifier = Modifier.size(50.dp),
-        shape = RoundedCornerShape(12.dp),
-        color = Color.DarkGray,
-    ) {
-        val current = bitmap
-        if (current != null) {
-            Image(
-                bitmap = current.asImageBitmap(),
-                contentDescription = "Latest OmniCam photo",
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop,
-            )
-        } else {
-            Box(contentAlignment = Alignment.Center) {
-                Text("Gallery", color = Color.White, style = MaterialTheme.typography.labelSmall)
-            }
+    Surface(Modifier.size(50.dp), RoundedCornerShape(12.dp), color = Color.DarkGray) {
+        bitmap?.let { image ->
+            Image(image.asImageBitmap(), "Latest photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        } ?: Box(contentAlignment = Alignment.Center) {
+            Text("Gallery", color = Color.White, style = MaterialTheme.typography.labelSmall)
         }
     }
 }
 
 @Composable
-private fun LensPill(
-    text: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
+private fun TopControl(text: String, enabled: Boolean, onClick: () -> Unit) {
+    TextButton(onClick = onClick, enabled = enabled) {
+        Text(text, color = if (enabled) Color.White else Color.White.copy(alpha = 0.4f), fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun LensPill(label: String, selected: Boolean, onClick: () -> Unit) {
     if (selected) {
-        Button(
-            onClick = onClick,
-            shape = CircleShape,
-            contentPadding = PaddingValues(horizontal = 15.dp, vertical = 8.dp),
-        ) {
-            Text(text, fontWeight = FontWeight.Bold)
+        Button(onClick = onClick, shape = CircleShape, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 7.dp)) {
+            Text(label, fontWeight = FontWeight.Bold)
         }
     } else {
-        TextButton(onClick = onClick) {
-            Text(text, color = Color.White)
-        }
+        TextButton(onClick = onClick) { Text(label, color = Color.White) }
     }
 }
 
 @Composable
-private fun CameraTextControl(
-    text: String,
-    enabled: Boolean = true,
-    onClick: () -> Unit,
-) {
-    TextButton(onClick = onClick, enabled = enabled) {
-        Text(
-            text = text,
-            color = if (enabled) Color.White else Color.White.copy(alpha = 0.4f),
-            fontWeight = FontWeight.SemiBold,
-        )
+private fun StatusPill(text: String, modifier: Modifier = Modifier) {
+    Surface(modifier, shape = RoundedCornerShape(18.dp), color = Color.Black.copy(alpha = 0.62f)) {
+        Text(text, Modifier.padding(horizontal = 12.dp, vertical = 6.dp), color = Color.White, style = MaterialTheme.typography.labelSmall)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun CameraSettingsSheet(
-    onDismiss: () -> Unit,
-    onManageLenses: () -> Unit,
-    onDiagnostics: () -> Unit,
-) {
+private fun SettingsSheet(onDismiss: () -> Unit, onLenses: () -> Unit, onDiagnostics: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 8.dp),
-        ) {
-            Text(
-                text = "Camera settings",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold,
-            )
+        Column(Modifier.fillMaxWidth().padding(20.dp)) {
+            Text("Camera settings", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(16.dp))
-            Button(
-                onClick = onManageLenses,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Manage lenses")
-            }
-            Spacer(Modifier.height(8.dp))
-            TextButton(
-                onClick = onDiagnostics,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Camera diagnostics")
-            }
-            Spacer(Modifier.height(24.dp))
+            Button(onClick = onLenses, modifier = Modifier.fillMaxWidth()) { Text("Manage lenses") }
+            TextButton(onClick = onDiagnostics, modifier = Modifier.fillMaxWidth()) { Text("Camera diagnostics") }
+            Spacer(Modifier.height(20.dp))
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun CameraLensManagerSheet(
+private fun LensManagerSheet(
     routes: List<ValuableCameraRoute>,
     preferences: LensPreferences,
     onDismiss: () -> Unit,
@@ -696,76 +569,32 @@ private fun CameraLensManagerSheet(
     onReset: () -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp),
-        ) {
-            Text(
-                text = "Lens layout",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold,
-            )
-            Text(
-                text = "Enable only the useful lenses you want and choose their order.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(12.dp))
-
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(420.dp),
-            ) {
-                listOf(LensFacing.BACK, LensFacing.FRONT).forEach { facing ->
-                    val faceRoutes = preferences.applyOrder(
-                        routes.filter { it.camera.lensFacing == facing },
-                        facing,
-                    )
-                    if (faceRoutes.isNotEmpty()) {
-                        item(key = "header-$facing") {
-                            Text(
-                                text = if (facing == LensFacing.BACK) "Rear cameras" else "Front cameras",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(vertical = 8.dp),
-                            )
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            Text("Lens layout", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Text("Enable useful lenses and choose their order. Logical/vendor duplicate routes stay hidden.", style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(10.dp))
+            LazyColumn(Modifier.fillMaxWidth().height(420.dp)) {
+                listOf(LensFacing.BACK, LensFacing.FRONT).forEach { face ->
+                    val ordered = preferences.applyOrder(routes.filter { it.camera.lensFacing == face }, face)
+                    if (ordered.isNotEmpty()) {
+                        item("header-$face") {
+                            Text(if (face == LensFacing.BACK) "Rear cameras" else "Front cameras", fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 8.dp))
                         }
-                        items(faceRoutes, key = { "$facing-${it.camera.id}" }) { route ->
-                            val index = faceRoutes.indexOfFirst { it.camera.id == route.camera.id }
-                            val enabled = preferences.isEnabled(route.camera.id)
-                            val enabledCount = faceRoutes.count { preferences.isEnabled(it.camera.id) }
-
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = lensManagerTitle(route),
-                                        fontWeight = FontWeight.SemiBold,
-                                    )
-                                    Text(
-                                        text = lensManagerSubtitle(route),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
+                        items(ordered, key = { "$face-${it.camera.id}" }) { item ->
+                            val index = ordered.indexOfFirst { it.camera.id == item.camera.id }
+                            val enabled = preferences.isEnabled(item.camera.id)
+                            val enabledCount = ordered.count { preferences.isEnabled(it.camera.id) }
+                            Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.width(185.dp)) {
+                                    Text(lensManagerTitle(item), fontWeight = FontWeight.SemiBold)
+                                    Text(lensManagerSubtitle(item), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
-                                TextButton(
-                                    enabled = index > 0,
-                                    onClick = { onMove(facing, route.camera.id, -1) },
-                                ) { Text("Up") }
-                                TextButton(
-                                    enabled = index < faceRoutes.lastIndex,
-                                    onClick = { onMove(facing, route.camera.id, 1) },
-                                ) { Text("Down") }
+                                TextButton(enabled = index > 0, onClick = { onMove(face, item.camera.id, -1) }) { Text("Up") }
+                                TextButton(enabled = index < ordered.lastIndex, onClick = { onMove(face, item.camera.id, 1) }) { Text("Down") }
                                 Switch(
                                     checked = enabled,
                                     enabled = !(enabled && enabledCount <= 1),
-                                    onCheckedChange = { onToggle(route.camera.id, it) },
+                                    onCheckedChange = { onToggle(item.camera.id, it) },
                                 )
                             }
                             HorizontalDivider()
@@ -773,14 +602,7 @@ private fun CameraLensManagerSheet(
                     }
                 }
             }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 16.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            Row(Modifier.fillMaxWidth().padding(vertical = 14.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                 TextButton(onClick = onReset) { Text("Reset") }
                 Button(onClick = onDismiss) { Text("Done") }
             }
@@ -789,68 +611,35 @@ private fun CameraLensManagerSheet(
 }
 
 @Composable
-private fun CameraPermissionScreen(onGrant: () -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(28.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text(
-            text = "OmniCam",
-            style = MaterialTheme.typography.displaySmall,
-            fontWeight = FontWeight.Bold,
-        )
-        Spacer(Modifier.height(10.dp))
-        Text("Camera permission is required for the live viewfinder and photo capture.")
-        Spacer(Modifier.height(20.dp))
-        Button(onClick = onGrant) { Text("Allow camera") }
-    }
-}
-
-@Composable
-private fun CameraErrorScreen(message: String) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(28.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text(
-            text = "Camera unavailable",
-            style = MaterialTheme.typography.headlineMedium,
-        )
+private fun CenterMessage(title: String, message: String, action: String? = null, onAction: (() -> Unit)? = null) {
+    Column(Modifier.fillMaxSize().padding(28.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(title, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         Text(message)
+        if (action != null && onAction != null) {
+            Spacer(Modifier.height(18.dp))
+            Button(onClick = onAction) { Text(action) }
+        }
     }
 }
 
 private fun requiredCameraPermissions(): Array<String> = buildList {
     add(Manifest.permission.CAMERA)
-    if (Build.VERSION.SDK_INT == Build.VERSION_CODES.P) {
-        add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-    }
+    if (Build.VERSION.SDK_INT == Build.VERSION_CODES.P) add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
 }.toTypedArray()
 
 private fun cameraPermissionsGranted(context: Context): Boolean = requiredCameraPermissions().all {
     ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
 }
 
-private fun displayRotationDegrees(textureView: TextureView): Int = when (
-    textureView.display?.rotation ?: Surface.ROTATION_0
-) {
+private fun displayRotationDegrees(textureView: TextureView): Int = when (textureView.display?.rotation ?: Surface.ROTATION_0) {
     Surface.ROTATION_90 -> 90
     Surface.ROTATION_180 -> 180
     Surface.ROTATION_270 -> 270
     else -> 0
 }
 
-private fun nextFlashMode(
-    current: CameraFlashMode,
-    supported: Boolean,
-): CameraFlashMode {
+private fun nextFlashMode(current: CameraFlashMode, supported: Boolean): CameraFlashMode {
     if (!supported) return CameraFlashMode.OFF
     return when (current) {
         CameraFlashMode.OFF -> CameraFlashMode.AUTO
@@ -867,26 +656,15 @@ private fun flashLabel(mode: CameraFlashMode): String = when (mode) {
     CameraFlashMode.TORCH -> "Torch"
 }
 
-private fun bindStatusText(result: CameraBindResult?): String? = when (result) {
-    is CameraBindResult.Failure -> "Lens ${result.cameraId}: ${result.reason}"
-    else -> null
-}
-
 private fun chooseDefaultRoute(routes: List<ValuableCameraRoute>): ValuableCameraRoute? = routes.minByOrNull { route ->
-    val eq = route.camera.equivalentFocalLengthsMm.minOrNull()
-        ?: return@minByOrNull Float.MAX_VALUE
-    val rolePenalty = if (route.camera.classification.role == LensRole.WIDE) 0f else 100f
-    rolePenalty + abs(eq - 26f)
+    val eq = route.camera.equivalentFocalLengthsMm.minOrNull() ?: return@minByOrNull Float.MAX_VALUE
+    val penalty = if (route.camera.classification.role == LensRole.WIDE) 0f else 100f
+    penalty + abs(eq - 26f)
 }
 
-private fun lensLabel(
-    route: ValuableCameraRoute,
-    mainEq: Float?,
-): String {
+private fun lensLabel(route: ValuableCameraRoute, mainEq: Float?): String {
     val eq = route.camera.equivalentFocalLengthsMm.minOrNull()
-    if (eq != null && mainEq != null && mainEq > 0f) {
-        return String.format(Locale.US, "%.1fx", eq / mainEq)
-    }
+    if (eq != null && mainEq != null && mainEq > 0f) return String.format(Locale.US, "%.1fx", eq / mainEq)
     return when (route.camera.classification.role) {
         LensRole.ULTRA_WIDE -> "UW"
         LensRole.TELEPHOTO -> "Tele"
@@ -901,10 +679,10 @@ private fun lensManagerTitle(route: ValuableCameraRoute): String =
 
 private fun lensManagerSubtitle(route: ValuableCameraRoute): String {
     val eq = route.camera.equivalentFocalLengthsMm.minOrNull()
-    val optical = eq?.let { String.format(Locale.US, "%.1f mm eq", it) } ?: "optics unknown"
+    val optics = eq?.let { String.format(Locale.US, "%.1f mm eq", it) } ?: "optics unknown"
     val access = when (route.access) {
         CameraRouteAccess.DIRECT_CAMERA_DEVICE -> "direct Camera2"
         CameraRouteAccess.PHYSICAL_VIA_LOGICAL -> "via logical ${route.logicalCameraIds.joinToString()}"
     }
-    return "$optical - $access"
+    return "$optics - $access"
 }
