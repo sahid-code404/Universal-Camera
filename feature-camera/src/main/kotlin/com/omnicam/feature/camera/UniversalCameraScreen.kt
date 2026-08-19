@@ -80,6 +80,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.omnicam.camera.camerax.Camera2PhotoController
 import com.omnicam.camera.camerax.CameraBindResult
 import com.omnicam.camera.camerax.CameraFlashMode
+import com.omnicam.camera.camerax.HeifEncodingPath
 import com.omnicam.camera.camerax.PhotoAspectRatio
 import com.omnicam.camera.camerax.PhotoCaptureResult
 import com.omnicam.camera.camerax.PhotoOutputFormat
@@ -110,7 +111,7 @@ fun UniversalCameraRoute(
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val haptics = LocalHapticFeedback.current
-    val textureView = remember(context) { TextureView(context).apply { isOpaque = false } }
+    val textureView = remember(context) { TextureView(context) }
     val preferences by preferencesStore.preferences.collectAsStateWithLifecycle(LensPreferences())
 
     var permissionsGranted by remember { mutableStateOf(cameraPermissionsGranted(context)) }
@@ -149,18 +150,18 @@ fun UniversalCameraRoute(
     val galleryLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
-        result.data?.data?.let { selected -> latestPhoto = selected }
+        result.data?.data?.let { latestPhoto = it }
     }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_RESUME -> lifecycleResumed = true
+            lifecycleResumed = when (event) {
+                Lifecycle.Event.ON_RESUME -> true
                 Lifecycle.Event.ON_PAUSE,
                 Lifecycle.Event.ON_STOP,
                 Lifecycle.Event.ON_DESTROY,
-                -> lifecycleResumed = false
-                else -> Unit
+                -> false
+                else -> lifecycleResumed
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -173,6 +174,7 @@ fun UniversalCameraRoute(
 
     LaunchedEffect(permissionsGranted) {
         if (!permissionsGranted) return@LaunchedEffect
+        scanError = null
         runCatching { scanner.scan() }
             .onSuccess { profile = it }
             .onFailure { scanError = it.message ?: it::class.java.simpleName }
@@ -214,6 +216,7 @@ fun UniversalCameraRoute(
         }
 
         bindResult = null
+        captureResult = null
         zoom = 1f
         exposure = 0f
         controller.setFlashMode(flash)
@@ -292,13 +295,7 @@ fun UniversalCameraRoute(
                 onFlash = {
                     flash = nextFlashMode(flash, selectedRoute?.camera?.flashAvailable == true)
                 },
-                onAspect = {
-                    aspect = if (aspect == PhotoAspectRatio.FOUR_THREE) {
-                        PhotoAspectRatio.SIXTEEN_NINE
-                    } else {
-                        PhotoAspectRatio.FOUR_THREE
-                    }
-                },
+                onAspect = { aspect = nextAspectRatio(aspect) },
                 onSettings = { settingsOpen = true },
                 onSelectLens = { selectedId = it },
                 onFlip = {
@@ -339,7 +336,9 @@ fun UniversalCameraRoute(
                     }
                     runCatching { galleryLauncher.launch(intent) }
                         .onFailure {
-                            captureResult = PhotoCaptureResult.Failure("No gallery app can open this photo")
+                            captureResult = PhotoCaptureResult.Failure(
+                                "No gallery app can open this photo",
+                            )
                         }
                 },
             )
@@ -444,7 +443,7 @@ private fun CameraView(
 
         AndroidView(
             factory = { textureView },
-            update = { view -> controller.updatePreviewTransform(view) },
+            update = { controller.updatePreviewTransform(it) },
             modifier = previewModifier
                 .align(Alignment.Center)
                 .pointerInput(route?.camera?.id, zoom) {
@@ -472,11 +471,7 @@ private fun CameraView(
                 route?.camera?.flashAvailable == true,
                 onFlash,
             )
-            TopControl(
-                if (aspect == PhotoAspectRatio.FOUR_THREE) "4:3" else "16:9",
-                true,
-                onAspect,
-            )
+            TopControl(aspect.label, true, onAspect)
             TopControl("Settings", true, onSettings)
         }
 
@@ -553,6 +548,8 @@ private fun CameraView(
                 buildString {
                     append(if (zoom > 1.02f) String.format(Locale.US, "%.1fx", zoom) else "PHOTO")
                     append(" · ")
+                    append(aspect.label)
+                    append(" · ")
                     append(if (photoFormat == PhotoOutputFormat.HEIF) "HEIF" else "JPEG")
                 },
                 color = Color.White.copy(alpha = 0.82f),
@@ -604,23 +601,7 @@ private fun CameraView(
                 }
             }
 
-            when (captureResult) {
-                is PhotoCaptureResult.Failure -> Text(
-                    captureResult.message,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp),
-                )
-                is PhotoCaptureResult.Success -> if (captureResult.usedFormatFallback) {
-                    Text(
-                        "HEIF is unavailable on this lens/session; saved JPEG at full requested quality.",
-                        color = Color.White.copy(alpha = 0.72f),
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp),
-                    )
-                }
-                null -> Unit
-            }
+            CaptureStatus(captureResult)
 
             if (maxZoom > minZoom + 0.01f) {
                 Slider(
@@ -632,6 +613,35 @@ private fun CameraView(
             }
         }
     }
+}
+
+@Composable
+private fun CaptureStatus(result: PhotoCaptureResult?) {
+    val message = when (result) {
+        is PhotoCaptureResult.Failure -> result.message
+        is PhotoCaptureResult.Success -> when {
+            result.usedFormatFallback -> "HEIF encoding unavailable; saved JPEG compatibility fallback."
+            result.actualFormat == PhotoOutputFormat.HEIF &&
+                result.heifEncodingPath == HeifEncodingPath.SOFTWARE_HEVC ->
+                "Saved HEIF using YUV + HEVC software pipeline."
+            result.actualFormat == PhotoOutputFormat.HEIF &&
+                result.heifEncodingPath == HeifEncodingPath.NATIVE_CAMERA ->
+                "Saved native Camera2 HEIF."
+            else -> null
+        }
+        null -> null
+    } ?: return
+
+    Text(
+        message,
+        color = if (result is PhotoCaptureResult.Failure) {
+            MaterialTheme.colorScheme.error
+        } else {
+            Color.White.copy(alpha = 0.76f)
+        },
+        style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp),
+    )
 }
 
 @Composable
@@ -651,9 +661,7 @@ private fun LatestThumbnail(uri: Uri?, onClick: () -> Unit) {
                             null,
                         )
                     } else {
-                        context.contentResolver.openInputStream(uri)?.use { input ->
-                            BitmapFactory.decodeStream(input)
-                        }
+                        context.contentResolver.openInputStream(uri)?.use(BitmapFactory::decodeStream)
                     }
                 }.getOrNull()
             }
@@ -697,9 +705,7 @@ private fun LensPill(label: String, selected: Boolean, onClick: () -> Unit) {
             onClick = onClick,
             shape = CircleShape,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 7.dp),
-        ) {
-            Text(label, fontWeight = FontWeight.Bold)
-        }
+        ) { Text(label, fontWeight = FontWeight.Bold) }
     } else {
         TextButton(onClick = onClick) { Text(label, color = Color.White) }
     }
@@ -746,19 +752,19 @@ private fun SettingsSheet(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                if (photoFormat == PhotoOutputFormat.HEIF) {
-                    Button(onClick = { onPhotoFormat(PhotoOutputFormat.HEIF) }) { Text("HEIF") }
-                } else {
-                    TextButton(onClick = { onPhotoFormat(PhotoOutputFormat.HEIF) }) { Text("HEIF") }
-                }
-                if (photoFormat == PhotoOutputFormat.JPEG) {
-                    Button(onClick = { onPhotoFormat(PhotoOutputFormat.JPEG) }) { Text("JPEG") }
-                } else {
-                    TextButton(onClick = { onPhotoFormat(PhotoOutputFormat.JPEG) }) { Text("JPEG") }
-                }
+                FormatButton(
+                    selected = photoFormat == PhotoOutputFormat.HEIF,
+                    text = "HEIF",
+                    onClick = { onPhotoFormat(PhotoOutputFormat.HEIF) },
+                )
+                FormatButton(
+                    selected = photoFormat == PhotoOutputFormat.JPEG,
+                    text = "JPEG",
+                    onClick = { onPhotoFormat(PhotoOutputFormat.JPEG) },
+                )
             }
             Text(
-                "HEIF is the default. OmniCam requests native HEIC/HEVC still output at the highest quality; if a lens or HAL does not support that session, it automatically falls back to JPEG instead of re-encoding a JPEG as HEIF.",
+                "HEIF first uses native Camera2 HEIC. If the lens/HAL does not expose HEIC, OmniCam captures YUV and encodes a real HEIF through the device HEVC codec. JPEG is now the final fallback only.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -772,7 +778,20 @@ private fun SettingsSheet(
                 steps = 29,
             )
             Text(
-                "100 asks the device for its best supported HEIF/JPEG quality. HEIF is more efficient, but it is not mathematically lossless.",
+                "100 requests the best available HEIF/JPEG encode quality. HEIF is efficient but is still normally lossy; RAW/DNG is the later path for sensor-level data.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(Modifier.height(16.dp))
+            Text("Aspect ratios", fontWeight = FontWeight.SemiBold)
+            Text(
+                PhotoAspectRatio.entries.joinToString(" · ") { it.label },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "Tap the aspect-ratio control in the camera header to cycle through them. Software HEIF can center-crop YUV without stretching when a lens does not advertise that exact output size.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -786,6 +805,15 @@ private fun SettingsSheet(
             }
             Spacer(Modifier.height(20.dp))
         }
+    }
+}
+
+@Composable
+private fun FormatButton(selected: Boolean, text: String, onClick: () -> Unit) {
+    if (selected) {
+        Button(onClick = onClick) { Text(text) }
+    } else {
+        TextButton(onClick = onClick) { Text(text) }
     }
 }
 
@@ -909,6 +937,11 @@ private fun displayRotationDegrees(textureView: TextureView): Int = when (
     Surface.ROTATION_180 -> 180
     Surface.ROTATION_270 -> 270
     else -> 0
+}
+
+private fun nextAspectRatio(current: PhotoAspectRatio): PhotoAspectRatio {
+    val values = PhotoAspectRatio.entries
+    return values[(values.indexOf(current) + 1) % values.size]
 }
 
 private fun nextFlashMode(current: CameraFlashMode, supported: Boolean): CameraFlashMode {
