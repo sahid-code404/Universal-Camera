@@ -30,10 +30,22 @@ import com.omnicam.camera.capability.ValuableCameraRoute
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.max
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -82,41 +94,84 @@ sealed interface ComputationalRawBindResult {
 }
 
 sealed interface ComputationalRawCaptureResult {
-    data class Success(
-        val uri: Uri,
+    /** Burst is safely file-backed; fusion/save continues without holding the shutter. */
+    data class Queued(
+        val jobId: Long,
         val width: Int,
         val height: Int,
         val frameCount: Int,
-        val acceptedSamples: Long,
-        val rejectedSamples: Long,
-        val alignments: List<ComputationalRawEngine.Alignment>,
         val preset: ComputationalRawPreset,
-        val elapsedMillis: Long,
+        val captureElapsedMillis: Long,
         val maximumResolutionMode: Boolean,
     ) : ComputationalRawCaptureResult
 
     data class Failure(val message: String) : ComputationalRawCaptureResult
 }
 
+enum class ComputationalRawJobStage {
+    QUEUED,
+    PROCESSING,
+    SAVING,
+    SAVED,
+    FAILED,
+}
+
+data class ComputationalRawJobStatus(
+    val id: Long,
+    val preset: ComputationalRawPreset,
+    val width: Int,
+    val height: Int,
+    val frameCount: Int,
+    val maximumResolutionMode: Boolean,
+    val captureElapsedMillis: Long,
+    val stage: ComputationalRawJobStage,
+    val message: String,
+    val processingElapsedMillis: Long = 0L,
+    val uri: Uri? = null,
+    val acceptedSamples: Long = 0L,
+    val rejectedSamples: Long = 0L,
+    val alignments: List<ComputationalRawEngine.Alignment> = emptyList(),
+) {
+    val terminal: Boolean get() = stage == ComputationalRawJobStage.SAVED || stage == ComputationalRawJobStage.FAILED
+}
+
 /**
- * DNG-only computational RAW controller.
+ * Realtime C-RAW controller.
  *
- * The camera still performs the full C1 burst acquisition, timestamp pairing, Bayer-safe alignment,
- * motion rejection and multi-frame RAW fusion. The experimental C2 demosaic/color/HEIF stage is
- * intentionally not invoked so capture completes as soon as the merged Bayer DNG is written.
+ * Capture is split into two independent stages:
+ *  1) sensor burst + immediate RAW16 scratch copy while the camera owns the frames;
+ *  2) alignment/fusion/DNG save on a process-level serial background queue.
+ *
+ * Preview is resumed before stage 2 starts and the shutter becomes available again. The queue is
+ * intentionally serial so several 12-frame jobs cannot compete for every CPU core and starve the
+ * viewfinder. RealtimeRawMerger still uses a few low-priority worker cores inside each job.
  */
 class ComputationalRawController(context: Context) {
     private val appContext = context.applicationContext
     private val cameraManager = appContext.getSystemService(CameraManager::class.java)
-    private val cameraThread = HandlerThread("OmniCam-C1-Camera").apply { start() }
-    private val imageThread = HandlerThread("OmniCam-C1-RawCopy").apply { start() }
+    private val cameraThread = HandlerThread("OmniCam-C16-Camera").apply { start() }
+    private val imageThread = HandlerThread("OmniCam-C16-RawCopy").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
     private val imageHandler = Handler(imageThread.looper)
+    private val scratchDir = java.io.File(appContext.cacheDir, "computational-raw")
     private val engine = ComputationalRawEngine(
         cameraHandler = cameraHandler,
         imageHandler = imageHandler,
-        scratchDir = java.io.File(appContext.cacheDir, "computational-raw"),
+        scratchDir = scratchDir,
     )
+
+    private val coordinatorDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "OmniCam-C16-PostQueue").apply {
+            priority = (Thread.NORM_PRIORITY - 2).coerceAtLeast(Thread.MIN_PRIORITY)
+        }
+    }.asCoroutineDispatcher()
+    private val processingScope = CoroutineScope(SupervisorJob() + coordinatorDispatcher)
+    private val processingQueue = Channel<PostJob>(capacity = MAX_PENDING_JOBS)
+    private val captureMutex = Mutex()
+    private val jobIdGenerator = AtomicLong(System.currentTimeMillis())
+    private val jobsLock = Any()
+    private val _jobs = MutableStateFlow<List<ComputationalRawJobStatus>>(emptyList())
+    val jobs: StateFlow<List<ComputationalRawJobStatus>> = _jobs.asStateFlow()
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -126,6 +181,13 @@ class ComputationalRawController(context: Context) {
     private var activeCharacteristics: CameraCharacteristics? = null
     private var activeCandidate: RawCandidate? = null
     @Volatile private var latestPreviewResult: TotalCaptureResult? = null
+
+    init {
+        engine.clearStaleScratch()
+        processingScope.launch {
+            for (job in processingQueue) processBackgroundJob(job)
+        }
+    }
 
     fun createViewfinderSpec(
         route: ValuableCameraRoute,
@@ -148,7 +210,7 @@ class ComputationalRawController(context: Context) {
             width = previewSize.width,
             height = previewSize.height,
             requestId = buildString {
-                append("c1-dng:")
+                append("c16-bg:")
                 append(route.camera.id)
                 append(':')
                 append(previewSize.width)
@@ -246,36 +308,52 @@ class ComputationalRawController(context: Context) {
         )
     }
 
+    /**
+     * Returns as soon as the RAW burst has been copied into scratch files and queued. Alignment,
+     * fusion and DNG writing continue independently in the background.
+     */
     suspend fun capture(
         preset: ComputationalRawPreset,
         onProgress: (String) -> Unit = {},
     ): ComputationalRawCaptureResult {
-        activeRoute ?: return ComputationalRawCaptureResult.Failure("No computational RAW camera is active")
-        val device = cameraDevice
-            ?: return ComputationalRawCaptureResult.Failure("Camera device is unavailable")
-        val session = captureSession
-            ?: return ComputationalRawCaptureResult.Failure("Capture session is unavailable")
-        val reader = rawReader
-            ?: return ComputationalRawCaptureResult.Failure("RAW output is unavailable")
-        val chars = activeCharacteristics
-            ?: return ComputationalRawCaptureResult.Failure("Camera characteristics are unavailable")
-        val candidate = activeCandidate
-            ?: return ComputationalRawCaptureResult.Failure("RAW candidate is unavailable")
+        if (!captureMutex.tryLock()) {
+            return ComputationalRawCaptureResult.Failure("A C-RAW sensor burst is already being captured")
+        }
+        try {
+            if (activeJobCount() >= MAX_PENDING_JOBS) {
+                return ComputationalRawCaptureResult.Failure(
+                    "Background RAW queue is full. Wait for one job to finish saving.",
+                )
+            }
 
-        val started = android.os.SystemClock.elapsedRealtime()
-        return runCatching {
-            val reference = latestPreviewResult ?: awaitReferenceResult(session)
-            val baseExposure = reference.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: DEFAULT_EXPOSURE_NS
-            val baseIso = reference.get(CaptureResult.SENSOR_SENSITIVITY) ?: DEFAULT_ISO
-            val focus = reference.get(CaptureResult.LENS_FOCUS_DISTANCE)
+            activeRoute ?: return ComputationalRawCaptureResult.Failure("No computational RAW camera is active")
+            val device = cameraDevice
+                ?: return ComputationalRawCaptureResult.Failure("Camera device is unavailable")
+            val session = captureSession
+                ?: return ComputationalRawCaptureResult.Failure("Capture session is unavailable")
+            val reader = rawReader
+                ?: return ComputationalRawCaptureResult.Failure("RAW output is unavailable")
+            val chars = activeCharacteristics
+                ?: return ComputationalRawCaptureResult.Failure("Camera characteristics are unavailable")
+            val candidate = activeCandidate
+                ?: return ComputationalRawCaptureResult.Failure("RAW candidate is unavailable")
 
-            onProgress(
-                "Capturing ${preset.frameCount} full-resolution RAW frames · ISO $baseIso · ${formatExposure(baseExposure)}",
-            )
-            val merged = withContext(Dispatchers.Default) {
+            val started = android.os.SystemClock.elapsedRealtime()
+            return runCatching {
+                val reference = latestPreviewResult ?: awaitReferenceResult(session)
+                val baseExposure = reference.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: DEFAULT_EXPOSURE_NS
+                val baseIso = reference.get(CaptureResult.SENSOR_SENSITIVITY) ?: DEFAULT_ISO
+                val focus = reference.get(CaptureResult.LENS_FOCUS_DISTANCE)
+
+                onProgress(
+                    "Capturing ${preset.frameCount} full-resolution RAW frames · ISO $baseIso · ${formatExposure(baseExposure)}",
+                )
+
+                // Only the sensor acquisition stage pauses the repeating request. Fusion never owns
+                // the Camera2 session and therefore cannot freeze the preview.
                 runCatching { session.stopRepeating() }
-                try {
-                    engine.captureAndMerge(
+                val burst = try {
+                    engine.captureToScratch(
                         device = device,
                         session = session,
                         reader = reader,
@@ -308,25 +386,100 @@ class ComputationalRawController(context: Context) {
                 } finally {
                     resumePreview()
                 }
-            }
 
-            onProgress("RAW fusion complete · writing merged DNG")
-            val uri = withContext(Dispatchers.IO) { saveMergedDng(merged, preset) }
-            ComputationalRawCaptureResult.Success(
-                uri = uri,
-                width = merged.width,
-                height = merged.height,
-                frameCount = merged.frameCount,
-                acceptedSamples = merged.acceptedSamples,
-                rejectedSamples = merged.rejectedSamples,
-                alignments = merged.alignments,
-                preset = preset,
-                elapsedMillis = android.os.SystemClock.elapsedRealtime() - started,
-                maximumResolutionMode = candidate.maximumResolutionMode,
+                val captureMillis = android.os.SystemClock.elapsedRealtime() - started
+                val jobId = jobIdGenerator.incrementAndGet()
+                val postJob = PostJob(
+                    id = jobId,
+                    burst = burst,
+                    preset = preset,
+                    maximumResolutionMode = candidate.maximumResolutionMode,
+                    captureElapsedMillis = captureMillis,
+                )
+                addJob(
+                    ComputationalRawJobStatus(
+                        id = jobId,
+                        preset = preset,
+                        width = burst.width,
+                        height = burst.height,
+                        frameCount = burst.frameCount,
+                        maximumResolutionMode = candidate.maximumResolutionMode,
+                        captureElapsedMillis = captureMillis,
+                        stage = ComputationalRawJobStage.QUEUED,
+                        message = "Queued for background RAW fusion",
+                    ),
+                )
+                if (!processingQueue.trySend(postJob).isSuccess) {
+                    removeJob(jobId)
+                    engine.discardCaptured(burst)
+                    error("Background RAW queue could not accept the capture")
+                }
+
+                onProgress(
+                    "${preset.frameCount} RAW captured in ${String.format(Locale.US, "%.1fs", captureMillis / 1000.0)} · processing in background · shutter ready",
+                )
+                ComputationalRawCaptureResult.Queued(
+                    jobId = jobId,
+                    width = burst.width,
+                    height = burst.height,
+                    frameCount = burst.frameCount,
+                    preset = preset,
+                    captureElapsedMillis = captureMillis,
+                    maximumResolutionMode = candidate.maximumResolutionMode,
+                )
+            }.getOrElse { error ->
+                runCatching { resumePreview() }
+                ComputationalRawCaptureResult.Failure(error.message ?: error::class.java.simpleName)
+            }
+        } finally {
+            captureMutex.unlock()
+        }
+    }
+
+    private suspend fun processBackgroundJob(job: PostJob) {
+        val started = android.os.SystemClock.elapsedRealtime()
+        updateJob(job.id) {
+            it.copy(
+                stage = ComputationalRawJobStage.PROCESSING,
+                message = "Background: fast Bayer alignment + temporal denoise",
             )
-        }.getOrElse { error ->
-            runCatching { resumePreview() }
-            ComputationalRawCaptureResult.Failure(error.message ?: error::class.java.simpleName)
+        }
+        try {
+            val merged = engine.mergeCaptured(job.burst)
+            updateJob(job.id) {
+                it.copy(
+                    stage = ComputationalRawJobStage.SAVING,
+                    message = "Background: writing merged DNG",
+                    acceptedSamples = merged.acceptedSamples,
+                    rejectedSamples = merged.rejectedSamples,
+                    alignments = merged.alignments,
+                )
+            }
+            val uri = withContext(Dispatchers.IO) { saveMergedDng(merged, job.preset) }
+            val elapsed = android.os.SystemClock.elapsedRealtime() - started
+            updateJob(job.id) {
+                it.copy(
+                    stage = ComputationalRawJobStage.SAVED,
+                    message = "Saved merged computational DNG",
+                    processingElapsedMillis = elapsed,
+                    uri = uri,
+                    acceptedSamples = merged.acceptedSamples,
+                    rejectedSamples = merged.rejectedSamples,
+                    alignments = merged.alignments,
+                )
+            }
+        } catch (error: Throwable) {
+            val elapsed = android.os.SystemClock.elapsedRealtime() - started
+            updateJob(job.id) {
+                it.copy(
+                    stage = ComputationalRawJobStage.FAILED,
+                    message = error.message ?: error::class.java.simpleName,
+                    processingElapsedMillis = elapsed,
+                )
+            }
+        } finally {
+            engine.discardCaptured(job.burst)
+            trimJobHistory()
         }
     }
 
@@ -334,6 +487,9 @@ class ComputationalRawController(context: Context) {
 
     fun shutdown() {
         closeCurrent()
+        processingQueue.close()
+        processingScope.cancel()
+        coordinatorDispatcher.close()
         cameraThread.quitSafely()
         imageThread.quitSafely()
     }
@@ -403,7 +559,7 @@ class ComputationalRawController(context: Context) {
                     merged.referenceResult,
                 ).use { creator ->
                     creator.setDescription(
-                        "OmniCam C-RAW ${preset.name}: ${merged.frameCount}-frame aligned RAW fusion",
+                        "OmniCam C-RAW ${preset.name}: ${merged.frameCount}-frame realtime background RAW fusion",
                     )
                     creator.writeByteBuffer(
                         output,
@@ -425,6 +581,36 @@ class ComputationalRawController(context: Context) {
         } catch (error: Throwable) {
             resolver.delete(uri, null, null)
             throw error
+        }
+    }
+
+    private fun addJob(status: ComputationalRawJobStatus) {
+        synchronized(jobsLock) {
+            _jobs.value = (listOf(status) + _jobs.value).take(MAX_JOB_HISTORY)
+        }
+    }
+
+    private fun updateJob(id: Long, transform: (ComputationalRawJobStatus) -> ComputationalRawJobStatus) {
+        synchronized(jobsLock) {
+            _jobs.value = _jobs.value.map { if (it.id == id) transform(it) else it }
+        }
+    }
+
+    private fun removeJob(id: Long) {
+        synchronized(jobsLock) {
+            _jobs.value = _jobs.value.filterNot { it.id == id }
+        }
+    }
+
+    private fun activeJobCount(): Int = synchronized(jobsLock) {
+        _jobs.value.count { !it.terminal }
+    }
+
+    private fun trimJobHistory() {
+        synchronized(jobsLock) {
+            val active = _jobs.value.filterNot { it.terminal }
+            val terminal = _jobs.value.filter { it.terminal }.take(MAX_COMPLETED_HISTORY)
+            _jobs.value = (active + terminal).sortedByDescending { it.id }.take(MAX_JOB_HISTORY)
         }
     }
 
@@ -568,11 +754,22 @@ class ComputationalRawController(context: Context) {
         val maximumResolutionMode: Boolean,
     )
 
+    private data class PostJob(
+        val id: Long,
+        val burst: ComputationalRawEngine.CapturedBurst,
+        val preset: ComputationalRawPreset,
+        val maximumResolutionMode: Boolean,
+        val captureElapsedMillis: Long,
+    )
+
     private companion object {
         const val RAW_READER_MAX_IMAGES = 4
         const val PREVIEW_MAX_LONG_EDGE = 1920
         const val PREVIEW_MAX_PIXELS = 2_500_000L
         const val DEFAULT_EXPOSURE_NS = 16_666_667L
         const val DEFAULT_ISO = 100
+        const val MAX_PENDING_JOBS = 3
+        const val MAX_COMPLETED_HISTORY = 4
+        const val MAX_JOB_HISTORY = MAX_PENDING_JOBS + MAX_COMPLETED_HISTORY
     }
 }
