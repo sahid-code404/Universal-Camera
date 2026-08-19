@@ -19,7 +19,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 
-@OptIn(ExperimentalCamera2Interop::class)
+@ExperimentalCamera2Interop
 class CameraXPreviewController(
     context: Context,
 ) {
