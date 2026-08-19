@@ -84,13 +84,9 @@ fun CameraLensTestRoute(
     var showLensManager by remember { mutableStateOf(false) }
 
     val resolution = remember(profile) { profile?.let(ValuableCameraResolver::resolve) }
-    val directRearRoutes = remember(resolution) {
-        resolution?.rearRoutes
-            ?.filter { it.access == CameraRouteAccess.DIRECT_CAMERA_DEVICE }
-            .orEmpty()
-    }
-    val orderedRearRoutes = remember(directRearRoutes, preferences) {
-        preferences.applyOrder(directRearRoutes, LensFacing.BACK)
+    val rearRoutes = remember(resolution) { resolution?.rearRoutes.orEmpty() }
+    val orderedRearRoutes = remember(rearRoutes, preferences) {
+        preferences.applyOrder(rearRoutes, LensFacing.BACK)
     }
     val enabledRearRoutes = remember(orderedRearRoutes, preferences) {
         orderedRearRoutes.filter { preferences.isEnabled(it.camera.id) }
@@ -109,18 +105,35 @@ fun CameraLensTestRoute(
         }
     }
 
-    LaunchedEffect(selectedCameraId) {
+    LaunchedEffect(selectedCameraId, enabledRearRoutes) {
         val cameraId = selectedCameraId ?: run {
             previewController.unbind()
             bindResult = null
             return@LaunchedEffect
         }
+        val route = enabledRearRoutes.firstOrNull { it.camera.id == cameraId } ?: return@LaunchedEffect
+
         binding = true
         captureResult = null
-        bindResult = previewController.bind(
-            textureView = textureView,
-            cameraId = cameraId,
-        )
+        bindResult = when (route.access) {
+            CameraRouteAccess.DIRECT_CAMERA_DEVICE -> previewController.bind(
+                textureView = textureView,
+                cameraId = cameraId,
+            )
+
+            CameraRouteAccess.PHYSICAL_VIA_LOGICAL -> {
+                val logicalId = route.logicalCameraIds.firstOrNull()
+                if (logicalId == null) {
+                    CameraBindResult.Failure(cameraId, "No parent logical camera is available")
+                } else {
+                    previewController.bindPhysical(
+                        textureView = textureView,
+                        logicalCameraId = logicalId,
+                        physicalCameraId = cameraId,
+                    )
+                }
+            }
+        }
         binding = false
     }
 
@@ -252,11 +265,21 @@ private fun LensTestContent(
                 .padding(vertical = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            val logicalPhysicalCount = orderedRearRoutes.count {
+                it.access == CameraRouteAccess.PHYSICAL_VIA_LOGICAL
+            }
             Text(
                 "${enabledRearRoutes.size} enabled · ${orderedRearRoutes.size} useful rear lenses · $rawRearCount raw rear routes",
                 color = Color.White.copy(alpha = 0.76f),
                 style = MaterialTheme.typography.bodySmall,
             )
+            if (logicalPhysicalCount > 0) {
+                Text(
+                    "$logicalPhysicalCount lens route(s) through standard logical/physical Camera2",
+                    color = Color.White.copy(alpha = 0.62f),
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
             if (excludedCount > 0) {
                 Text(
                     "$excludedCount logical/duplicate/non-photo routes kept in diagnostics only",
@@ -446,16 +469,16 @@ private fun LensTestError(message: String, onBack: () -> Unit) {
 }
 
 private fun bindStatus(result: CameraBindResult?, binding: Boolean): String = when (result) {
-    is CameraBindResult.Success -> "Camera2 direct · requested ${result.requestedCameraId} · active ${result.actualCameraId}"
+    is CameraBindResult.Success -> "Camera2 route · requested ${result.requestedCameraId} · active ${result.actualCameraId}"
     is CameraBindResult.Failure -> "Camera ${result.cameraId} failed: ${result.reason}"
-    null -> if (binding) "Opening exact Camera2 ID…" else "Select a camera"
+    null -> if (binding) "Opening Camera2 lens route…" else "Select a camera"
 }
 
 private fun captureStatus(result: CaptureProbeResult?): String = when (result) {
     is CaptureProbeResult.Success ->
         "Frame OK · ID ${result.cameraId} · ${result.width}×${result.height} · format ${result.format}"
     is CaptureProbeResult.Failure -> "Frame probe failed: ${result.reason}"
-    null -> "Direct Camera2 preview. Lens visibility/order is now resolved independently from raw HAL route count."
+    null -> "Camera2 preview supports direct IDs and standard physical-via-logical lens routing."
 }
 
 private fun chooseDefaultRearRoute(routes: List<ValuableCameraRoute>): ValuableCameraRoute? = routes
