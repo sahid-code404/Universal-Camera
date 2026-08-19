@@ -8,6 +8,7 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.viewfinder.compose.Viewfinder
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -20,13 +21,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,6 +38,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -48,7 +49,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -77,12 +77,12 @@ import com.omnicam.camera.capability.ValuableCameraRoute
 import com.omnicam.core.model.LensFacing
 import com.omnicam.core.model.LensRole
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.math.abs
-import kotlin.math.roundToInt
 
 private val CameraYellow = Color(0xFFFFD60A)
 
@@ -105,8 +105,7 @@ fun LightningCameraRoute(
     val scope = rememberCoroutineScope()
     val jobs by controller.jobs.collectAsState()
     val cameraState by controller.cameraState.collectAsState()
-    val activeJobs = jobs.count { !it.terminal }
-    val queueFull = activeJobs >= 3
+    val queueFull = jobs.count { !it.terminal } >= 3
 
     var permissionGranted by remember { mutableStateOf(hasCameraPermission(context)) }
     var routes by remember { mutableStateOf<List<ValuableCameraRoute>>(emptyList()) }
@@ -177,7 +176,7 @@ fun LightningCameraRoute(
     val overallZoom = selectedFactor * cameraState.zoomRatio
     val lastSaved = jobs.firstOrNull { it.stage == LightningJobStage.SAVED && it.dngUri != null }
 
-    LaunchedEffect(selected?.camera?.id, lifecycleResumed, aspect) {
+    LaunchedEffect(selected?.camera?.id, lifecycleResumed, aspect, viewerUri) {
         controller.unbind()
         bindResult = null
         if (!lifecycleResumed || viewerUri != null) {
@@ -197,10 +196,6 @@ fun LightningCameraRoute(
         }.onFailure {
             bindResult = ComputationalRawBindResult.Failure(route.camera.id, it.message ?: "Camera unavailable")
         }.getOrNull()
-    }
-
-    LaunchedEffect(viewerUri) {
-        if (viewerUri != null) controller.unbind()
     }
 
     LaunchedEffect(jobs, capturing) {
@@ -226,32 +221,27 @@ fun LightningCameraRoute(
             routes.isEmpty() -> CenterMessage("RAW unavailable", "No useful direct RAW_SENSOR camera is exposed on this device.")
             else -> Column(Modifier.fillMaxSize().background(Color.Black)) {
                 Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .background(Color.Black),
+                    Modifier.fillMaxWidth().weight(1f).background(Color.Black),
                     contentAlignment = Alignment.Center,
                 ) {
-                    val currentSpec = spec
-                    val currentRoute = selected
                     val previewModifier = when (aspect) {
                         PhotoAspect.FULL -> Modifier.fillMaxSize()
                         else -> Modifier.fillMaxWidth().aspectRatio(1f / (aspect.sensorRatio ?: 4f / 3f))
                     }
                     Box(previewModifier.background(Color.Black), contentAlignment = Alignment.Center) {
+                        val currentSpec = spec
+                        val currentRoute = selected
                         if (currentSpec != null && currentRoute != null && lifecycleResumed) {
                             Viewfinder(
                                 surfaceRequest = currentSpec.surfaceRequest,
                                 transformationInfo = currentSpec.transformationInfo,
                                 alignment = Alignment.Center,
                                 contentScale = ContentScale.Crop,
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .pointerInput(cameraState.maxZoomRatio, selectedId) {
-                                        detectTransformGestures { _, _, gestureZoom, _ ->
-                                            controller.setZoomRatio(controller.cameraState.value.zoomRatio * gestureZoom)
-                                        }
-                                    },
+                                modifier = Modifier.fillMaxSize().pointerInput(cameraState.maxZoomRatio, selectedId) {
+                                    detectTransformGestures { _, _, gestureZoom, _ ->
+                                        controller.setZoomRatio(controller.cameraState.value.zoomRatio * gestureZoom)
+                                    }
+                                },
                             ) {
                                 onSurfaceSession {
                                     bindResult = controller.bind(surface, currentSpec, currentRoute)
@@ -264,10 +254,7 @@ fun LightningCameraRoute(
                         }
 
                         Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .align(Alignment.TopCenter)
-                                .padding(top = 14.dp, start = 12.dp, end = 12.dp),
+                            Modifier.fillMaxWidth().align(Alignment.TopCenter).padding(top = 14.dp, start = 12.dp, end = 12.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -330,24 +317,25 @@ fun LightningCameraRoute(
                     },
                     canFlip = routes.any { it.camera.lensFacing != selected?.camera?.lensFacing },
                     onCapture = {
-                        if (capturing || queueFull) return@CameraControls
-                        capturing = true
-                        status = "Capturing"
-                        scope.launch {
-                            val result = controller.capture(
-                                preset = preset,
-                                tuning = LightningRawTuning(
-                                    denoiseStrength = denoise,
-                                    highlightProtection = highlight,
-                                    upscaleFactor = upscale,
-                                    aspectRatio = aspect.sensorRatio,
-                                ),
-                            ) { status = it }
-                            status = when (result) {
-                                is LightningCaptureResult.Queued -> "DNG processing"
-                                is LightningCaptureResult.Failure -> result.message
+                        if (!capturing && !queueFull) {
+                            capturing = true
+                            status = "Capturing"
+                            scope.launch {
+                                val result = controller.capture(
+                                    preset = preset,
+                                    tuning = LightningRawTuning(
+                                        denoiseStrength = denoise,
+                                        highlightProtection = highlight,
+                                        upscaleFactor = upscale,
+                                        aspectRatio = aspect.sensorRatio,
+                                    ),
+                                ) { status = it }
+                                status = when (result) {
+                                    is LightningCaptureResult.Queued -> "DNG processing"
+                                    is LightningCaptureResult.Failure -> result.message
+                                }
+                                capturing = false
                             }
-                            capturing = false
                         }
                     },
                 )
@@ -403,7 +391,6 @@ private fun CameraControls(
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier.padding(top = 3.dp),
         )
-
         if (maxZoom > minZoom + 0.02f) {
             Slider(
                 value = cameraStateZoom.coerceIn(minZoom, maxZoom),
@@ -511,23 +498,21 @@ private fun ControlTile(label: String, selected: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun RuleOfThirdsGrid(modifier: Modifier = Modifier) {
-    androidx.compose.foundation.Canvas(modifier) {
-        val paint = Color.White.copy(alpha = 0.22f)
+    Canvas(modifier) {
+        val line = Color.White.copy(alpha = 0.22f)
         val stroke = 1.dp.toPx()
-        drawLine(paint, start = androidx.compose.ui.geometry.Offset(size.width / 3f, 0f), end = androidx.compose.ui.geometry.Offset(size.width / 3f, size.height), strokeWidth = stroke)
-        drawLine(paint, start = androidx.compose.ui.geometry.Offset(size.width * 2f / 3f, 0f), end = androidx.compose.ui.geometry.Offset(size.width * 2f / 3f, size.height), strokeWidth = stroke)
-        drawLine(paint, start = androidx.compose.ui.geometry.Offset(0f, size.height / 3f), end = androidx.compose.ui.geometry.Offset(size.width, size.height / 3f), strokeWidth = stroke)
-        drawLine(paint, start = androidx.compose.ui.geometry.Offset(0f, size.height * 2f / 3f), end = androidx.compose.ui.geometry.Offset(size.width, size.height * 2f / 3f), strokeWidth = stroke)
+        drawLine(line, androidx.compose.ui.geometry.Offset(size.width / 3f, 0f), androidx.compose.ui.geometry.Offset(size.width / 3f, size.height), stroke)
+        drawLine(line, androidx.compose.ui.geometry.Offset(size.width * 2f / 3f, 0f), androidx.compose.ui.geometry.Offset(size.width * 2f / 3f, size.height), stroke)
+        drawLine(line, androidx.compose.ui.geometry.Offset(0f, size.height / 3f), androidx.compose.ui.geometry.Offset(size.width, size.height / 3f), stroke)
+        drawLine(line, androidx.compose.ui.geometry.Offset(0f, size.height * 2f / 3f), androidx.compose.ui.geometry.Offset(size.width, size.height * 2f / 3f), stroke)
     }
 }
 
 @Composable
 private fun GlassChip(text: String, onClick: () -> Unit) {
-    Surface(
-        modifier = Modifier.clickable(onClick = onClick),
-        shape = CircleShape,
-        color = Color.Black.copy(alpha = 0.46f),
-    ) { Text(text, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp)) }
+    Surface(modifier = Modifier.clickable(onClick = onClick), shape = CircleShape, color = Color.Black.copy(alpha = 0.46f)) {
+        Text(text, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp))
+    }
 }
 
 @Composable
@@ -557,11 +542,8 @@ private fun ModeLabel(label: String, selected: Boolean, onClick: () -> Unit) {
 @Composable
 private fun ShutterButton(enabled: Boolean, capturing: Boolean, onClick: () -> Unit) {
     Box(
-        Modifier
-            .size(78.dp)
-            .border(4.dp, if (enabled) Color.White else Color.Gray, CircleShape)
-            .padding(6.dp)
-            .background(if (capturing) Color.LightGray else Color.White, CircleShape)
+        Modifier.size(78.dp).border(4.dp, if (enabled) Color.White else Color.Gray, CircleShape)
+            .padding(6.dp).background(if (capturing) Color.LightGray else Color.White, CircleShape)
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
@@ -618,21 +600,27 @@ private fun DngViewer(uri: Uri, onClose: () -> Unit) {
 }
 
 @Composable
-private fun rememberDngBitmap(uri: Uri?, maxSide: Int) = produceState<ImageBitmap?>(initialValue = null, uri, maxSide) {
-    value = if (uri == null) null else withContext(Dispatchers.IO) {
-        runCatching {
-            val source = ImageDecoder.createSource(LocalContext.current.contentResolver, uri)
-            ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
-                val width = info.size.width
-                val height = info.size.height
-                val longest = maxOf(width, height)
-                if (longest > maxSide) {
-                    val scale = maxSide.toFloat() / longest
-                    decoder.setTargetSize((width * scale).roundToInt().coerceAtLeast(1), (height * scale).roundToInt().coerceAtLeast(1))
-                }
-                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-            }.asImageBitmap()
-        }.getOrNull()
+private fun rememberDngBitmap(uri: Uri?, maxSide: Int): State<ImageBitmap?> {
+    val context = LocalContext.current
+    return produceState<ImageBitmap?>(initialValue = null, uri, maxSide) {
+        value = if (uri == null) null else withContext(Dispatchers.IO) {
+            runCatching {
+                val source = ImageDecoder.createSource(context.contentResolver, uri)
+                ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    val width = info.size.width
+                    val height = info.size.height
+                    val longest = maxOf(width, height)
+                    if (longest > maxSide) {
+                        val scale = maxSide.toFloat() / longest
+                        decoder.setTargetSize(
+                            (width * scale).roundToInt().coerceAtLeast(1),
+                            (height * scale).roundToInt().coerceAtLeast(1),
+                        )
+                    }
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                }.asImageBitmap()
+            }.getOrNull()
+        }
     }
 }
 
