@@ -2,11 +2,8 @@ package com.omnicam.feature.camera
 
 import android.Manifest
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.view.Surface as AndroidSurface
-import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.viewfinder.compose.MutableCoordinateTransformer
@@ -20,7 +17,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
@@ -29,6 +25,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -47,13 +44,16 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
@@ -129,6 +129,10 @@ fun LiquidCameraRoute(
     var resumed by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
     }
+    var pendingCaptureOrientation by remember { mutableStateOf<Pair<String, Int>?>(null) }
+    val placeholderUris = remember { mutableStateMapOf<Long, android.net.Uri>() }
+    val jobOrientations = remember { mutableStateMapOf<Long, Pair<String, Int>>() }
+    val orientationFixed = remember { mutableStateMapOf<Long, Boolean>() }
 
     val uiStore = remember { context.getSharedPreferences("omnicam_liquid_ui", Context.MODE_PRIVATE) }
     var previewBackend by remember {
@@ -140,7 +144,6 @@ fun LiquidCameraRoute(
             }.getOrDefault(LiquidPreviewBackend.SURFACE),
         )
     }
-
     val lensScaleStore = remember {
         context.getSharedPreferences("omnicam_lens_upscale", Context.MODE_PRIVATE)
     }
@@ -230,13 +233,49 @@ fun LiquidCameraRoute(
         controller.unbind()
     }
 
+    LaunchedEffect(jobs) {
+        val active = jobs.firstOrNull { !it.terminal && !jobOrientations.containsKey(it.id) }
+        if (active != null) {
+            pendingCaptureOrientation?.let { orientation ->
+                jobOrientations[active.id] = orientation
+                pendingCaptureOrientation = null
+            }
+            if (!placeholderUris.containsKey(active.id)) {
+                ProcessingAlbumBridge.createPlaceholder(context, active.id)?.let {
+                    placeholderUris[active.id] = it
+                }
+            }
+        }
+
+        jobs.filter { it.terminal }.forEach { job ->
+            val placeholder = placeholderUris.remove(job.id)
+            if (placeholder != null) ProcessingAlbumBridge.removePlaceholder(context, placeholder)
+            if (
+                job.stage == LightningJobStage.SAVED &&
+                job.dngUri != null &&
+                orientationFixed[job.id] != true
+            ) {
+                val orientation = jobOrientations[job.id]
+                if (orientation != null) {
+                    ProcessingAlbumBridge.fixDngOrientation(
+                        context = context,
+                        uri = job.dngUri,
+                        cameraId = orientation.first,
+                        displayRotationDegrees = orientation.second,
+                    )
+                }
+                orientationFixed[job.id] = true
+            }
+        }
+    }
+
     LaunchedEffect(jobs, capturing) {
         if (capturing) return@LaunchedEffect
         val active = jobs.firstOrNull { !it.terminal }
         val failed = jobs.firstOrNull { it.stage == LightningJobStage.FAILED }
         val saved = jobs.firstOrNull { it.stage == LightningJobStage.SAVED }
         message = when {
-            active != null -> "Processing ${jobs.count { !it.terminal }}"
+            active != null -> "Processing RAW"
             failed != null && failed.id > (saved?.id ?: 0L) -> "Capture failed"
             saved != null -> "Saved ${saved.outputWidth}×${saved.outputHeight} DNG"
             else -> "Ready"
@@ -263,6 +302,7 @@ fun LiquidCameraRoute(
                         route = route,
                         controller = controller,
                         backend = previewBackend,
+                        aspect = aspect,
                         focusState = focusState,
                         gridEnabled = gridEnabled,
                         maxZoom = cameraState.maxZoomRatio,
@@ -279,7 +319,7 @@ fun LiquidCameraRoute(
                     Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .fillMaxHeight(0.40f),
+                        .fillMaxHeight(0.36f),
                 )
 
                 LiquidTopControls(
@@ -292,13 +332,7 @@ fun LiquidCameraRoute(
                             controller.setFlashMode(nextLiquidFlash(cameraState.flashMode))
                         }
                     },
-                    onPreset = {
-                        preset = when (preset) {
-                            ComputationalRawPreset.QUALITY -> ComputationalRawPreset.HDR
-                            ComputationalRawPreset.HDR -> ComputationalRawPreset.MAX
-                            ComputationalRawPreset.MAX -> ComputationalRawPreset.QUALITY
-                        }
-                    },
+                    onPreset = { preset = nextPreset(preset) },
                     onAspect = {
                         aspect = when (aspect) {
                             LiquidAspect.FOUR_THREE -> LiquidAspect.SIXTEEN_NINE
@@ -323,27 +357,23 @@ fun LiquidCameraRoute(
                     selectedId = selectedId,
                     baseEq = baseEq,
                     displayZoom = displayZoom,
-                    preset = preset,
                     message = if (queueFull) "Processing queue full" else message,
                     capturing = capturing,
                     captureEnabled = !capturing && !queueFull && bindResult is ComputationalRawBindResult.Success,
-                    lastUri = lastSaved?.dngUri,
+                    hasSavedPhoto = lastSaved?.dngUri != null,
                     canFlip = routes.any { it.camera.lensFacing != selected?.camera?.lensFacing },
                     onLens = { selectedId = it },
-                    onPreset = { preset = it },
-                    onGallery = { lastSaved?.dngUri?.let { liquidOpenExternalDng(context, it) } },
+                    onGallery = { ProcessingAlbumBridge.openAlbum(context) },
                     onFlip = {
-                        val opposite = if (selected?.camera?.lensFacing == LensFacing.FRONT) {
-                            LensFacing.BACK
-                        } else {
-                            LensFacing.FRONT
-                        }
+                        val opposite = if (selected?.camera?.lensFacing == LensFacing.FRONT) LensFacing.BACK else LensFacing.FRONT
                         liquidWidest(routes.filter { it.camera.lensFacing == opposite })?.let {
                             selectedId = it.camera.id
                         }
                     },
                     onCapture = {
-                        if (!capturing && !queueFull) {
+                        val cameraId = selectedId
+                        if (!capturing && !queueFull && cameraId != null) {
+                            pendingCaptureOrientation = cameraId to displayRotation
                             capturing = true
                             message = "Capturing native RAW"
                             scope.launch {
@@ -357,9 +387,10 @@ fun LiquidCameraRoute(
                                     ),
                                 ) { progress -> message = progress }
                                 message = when (result) {
-                                    is LightningCaptureResult.Queued -> "Processing DNG"
+                                    is LightningCaptureResult.Queued -> "Processing RAW"
                                     is LightningCaptureResult.Failure -> result.message
                                 }
+                                if (result is LightningCaptureResult.Failure) pendingCaptureOrientation = null
                                 capturing = false
                             }
                         }
@@ -395,7 +426,7 @@ fun LiquidCameraRoute(
                         onHighlight = { highlight = it },
                         onGrid = { gridEnabled = !gridEnabled },
                         onClose = { drawerOpen = false },
-                        modifier = Modifier.padding(end = 12.dp, bottom = 206.dp, start = 54.dp),
+                        modifier = Modifier.padding(end = 12.dp, bottom = 194.dp, start = 54.dp),
                     )
                 }
             }
@@ -409,6 +440,7 @@ private fun LiquidPreview(
     route: ValuableCameraRoute,
     controller: LightningRawController,
     backend: LiquidPreviewBackend,
+    aspect: LiquidAspect,
     focusState: LightningFocusState,
     gridEnabled: Boolean,
     maxZoom: Float,
@@ -432,49 +464,63 @@ private fun LiquidPreview(
         )
     }
 
-    Box(modifier.background(Color.Black)) {
-        Viewfinder(
-            surfaceRequest = surfaceRequest,
-            transformationInfo = transformationInfo,
-            coordinateTransformer = coordinateTransformer,
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInput(route.camera.id, maxZoom) {
-                    detectTransformGestures { _, _, gestureZoom, _ ->
-                        controller.setZoomRatio(controller.cameraState.value.zoomRatio * gestureZoom)
+    Box(modifier.background(Color.Black), contentAlignment = Alignment.Center) {
+        // iPhone-style composition behavior: the selected photo aspect is the real visible frame.
+        // The viewfinder is no longer stretched to the whole display and then cropped differently at
+        // save time. What is inside this box is what the DNG transform keeps.
+        val frame = if (aspect.ratio == null) {
+            Modifier.fillMaxSize()
+        } else {
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f / aspect.ratio)
+                .clipToBounds()
+        }
+        Box(frame.background(Color.Black), contentAlignment = Alignment.Center) {
+            Viewfinder(
+                surfaceRequest = surfaceRequest,
+                transformationInfo = transformationInfo,
+                coordinateTransformer = coordinateTransformer,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(route.camera.id, maxZoom) {
+                        detectTransformGestures { _, _, gestureZoom, _ ->
+                            controller.setZoomRatio(controller.cameraState.value.zoomRatio * gestureZoom)
+                        }
                     }
-                }
-                .pointerInput(route.camera.id, spec, backend) {
-                    detectTapGestures { tap ->
-                        if (size.width <= 0 || size.height <= 0) return@detectTapGestures
-                        val bufferPoint = with(coordinateTransformer) { tap.transform() }
-                        controller.focusAtBuffer(
-                            bufferX = bufferPoint.x,
-                            bufferY = bufferPoint.y,
-                            bufferWidth = spec.previewSize.width,
-                            bufferHeight = spec.previewSize.height,
-                            indicatorX = tap.x / size.width.toFloat(),
-                            indicatorY = tap.y / size.height.toFloat(),
-                        )
-                    }
-                },
-        ) {
-            onSurfaceSession {
-                val result = controller.bindSurface(spec, route, surface)
-                withContext(Dispatchers.Main.immediate) { onBindResult(result) }
-                if (result is ComputationalRawBindResult.Success) {
-                    try {
-                        awaitCancellation()
-                    } finally {
-                        withContext(NonCancellable + Dispatchers.Main.immediate) {
-                            controller.unbindSurface(surface)
+                    .pointerInput(route.camera.id, spec, backend) {
+                        detectTapGestures { tap ->
+                            if (size.width <= 0 || size.height <= 0) return@detectTapGestures
+                            val bufferPoint = with(coordinateTransformer) { tap.transform() }
+                            controller.focusAtBuffer(
+                                bufferX = bufferPoint.x,
+                                bufferY = bufferPoint.y,
+                                bufferWidth = spec.previewSize.width,
+                                bufferHeight = spec.previewSize.height,
+                                indicatorX = tap.x / size.width.toFloat(),
+                                indicatorY = tap.y / size.height.toFloat(),
+                            )
+                        }
+                    },
+            ) {
+                onSurfaceSession {
+                    val result = controller.bindSurface(spec, route, surface)
+                    withContext(Dispatchers.Main.immediate) { onBindResult(result) }
+                    if (result is ComputationalRawBindResult.Success) {
+                        try {
+                            awaitCancellation()
+                        } finally {
+                            withContext(NonCancellable + Dispatchers.Main.immediate) {
+                                controller.unbindSurface(surface)
+                            }
                         }
                     }
                 }
             }
+            if (gridEnabled) LiquidGrid(Modifier.fillMaxSize())
+            LiquidFocusIndicator(focusState, Modifier.fillMaxSize())
         }
-        if (gridEnabled) LiquidGrid(Modifier.fillMaxSize())
-        LiquidFocusIndicator(focusState, Modifier.fillMaxSize())
     }
 }
 
@@ -510,7 +556,8 @@ private fun LiquidTopControls(
             onClick = onFlash,
         )
         GlassPillButton("DNG", selected = true, onClick = {})
-        GlassPillButton(preset.name, selected = preset != ComputationalRawPreset.QUALITY, onClick = onPreset)
+        // This is the only mode selector. Tapping it cycles QUALITY → HDR → MAX.
+        GlassPillButton(preset.name, selected = true, onClick = onPreset)
         GlassPillButton(aspect.label, onClick = onAspect)
         GlassCircleButton("•••", onClick = onMore)
     }
@@ -546,21 +593,19 @@ private fun LiquidCaptureArea(
     selectedId: String?,
     baseEq: Float,
     displayZoom: Float,
-    preset: ComputationalRawPreset,
     message: String,
     capturing: Boolean,
     captureEnabled: Boolean,
-    lastUri: Uri?,
+    hasSavedPhoto: Boolean,
     canFlip: Boolean,
     onLens: (String) -> Unit,
-    onPreset: (ComputationalRawPreset) -> Unit,
     onGallery: () -> Unit,
     onFlip: () -> Unit,
     onCapture: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
-        modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 22.dp),
+        modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Row(
@@ -581,35 +626,25 @@ private fun LiquidCaptureArea(
             color = Color.White.copy(alpha = 0.72f),
             fontSize = 10.sp,
             maxLines = 1,
-            modifier = Modifier.padding(top = 7.dp, bottom = 7.dp),
+            modifier = Modifier.padding(top = 7.dp),
         )
-
-        LiquidPresetSelector(
-            labels = listOf("QUALITY", "HDR", "MAX"),
-            selectedIndex = when (preset) {
-                ComputationalRawPreset.QUALITY -> 0
-                ComputationalRawPreset.HDR -> 1
-                ComputationalRawPreset.MAX -> 2
-            },
-            onSelected = {
-                onPreset(
-                    when (it) {
-                        0 -> ComputationalRawPreset.QUALITY
-                        1 -> ComputationalRawPreset.HDR
-                        else -> ComputationalRawPreset.MAX
-                    },
-                )
-            },
+        // Bottom no longer duplicates QUALITY/HDR/MAX. This camera has one still-photo mode.
+        Text(
+            "PHOTO",
+            color = Color.White,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(top = 7.dp, bottom = 4.dp),
         )
 
         Row(
-            Modifier.fillMaxWidth().padding(top = 10.dp),
+            Modifier.fillMaxWidth().padding(top = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
             GlassCircleButton(
-                text = if (lastUri != null) "IMG" else "—",
-                enabled = lastUri != null,
+                text = if (hasSavedPhoto) "IMG" else "—",
+                enabled = hasSavedPhoto,
                 sizeDp = 54,
                 onClick = onGallery,
             )
@@ -657,14 +692,12 @@ private fun LiquidAdvancedDrawer(
                 Text("CAMERA CONTROLS", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                 GlassCircleButton("×", sizeDp = 36, onClick = onClose)
             }
-
             Text("ASPECT", color = LiquidTextDim, fontSize = 9.sp, modifier = Modifier.padding(top = 9.dp, bottom = 5.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 LiquidAspect.entries.forEach { option ->
                     GlassPillButton(option.label, selected = option == aspect) { onAspect(option) }
                 }
             }
-
             Text("PREVIEW", color = LiquidTextDim, fontSize = 9.sp, modifier = Modifier.padding(top = 10.dp, bottom = 5.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 LiquidPreviewBackend.entries.forEach { option ->
@@ -672,7 +705,6 @@ private fun LiquidAdvancedDrawer(
                 }
                 GlassPillButton(if (gridEnabled) "GRID ON" else "GRID OFF", selected = gridEnabled, onClick = onGrid)
             }
-
             DrawerSlider(
                 label = "PER-LENS UPSCALE",
                 value = upscale,
@@ -697,9 +729,8 @@ private fun LiquidAdvancedDrawer(
                 steps = 19,
                 onValue = onHighlight,
             )
-
             Text(
-                "Native DNG only · RAW is created only during shutter capture",
+                "Final output is DNG only · processing placeholder is temporary",
                 color = Color.White.copy(alpha = 0.48f),
                 fontSize = 9.sp,
                 textAlign = TextAlign.Center,
@@ -722,6 +753,12 @@ private fun LiquidCenterMessage(text: String, action: (() -> Unit)? = null) {
             GlassPillButton("Continue", onClick = action)
         }
     }
+}
+
+private fun nextPreset(value: ComputationalRawPreset): ComputationalRawPreset = when (value) {
+    ComputationalRawPreset.QUALITY -> ComputationalRawPreset.HDR
+    ComputationalRawPreset.HDR -> ComputationalRawPreset.MAX
+    ComputationalRawPreset.MAX -> ComputationalRawPreset.QUALITY
 }
 
 private fun nextLiquidFlash(mode: LightningFlashMode): LightningFlashMode = when (mode) {
@@ -757,12 +794,3 @@ private fun liquidRotationDegrees(rotation: Int): Int = when (rotation) {
 
 private fun hasCameraPermission(context: Context): Boolean =
     ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-
-private fun liquidOpenExternalDng(context: Context, uri: Uri) {
-    val intent = Intent(Intent.ACTION_VIEW).apply {
-        setDataAndType(uri, "image/x-adobe-dng")
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    }
-    runCatching { context.startActivity(Intent.createChooser(intent, "Open DNG with")) }
-        .onFailure { Toast.makeText(context, "No app can open this DNG", Toast.LENGTH_SHORT).show() }
-}
