@@ -250,16 +250,17 @@ fun LiquidCameraRoute(
         jobs.filter { it.terminal }.forEach { job ->
             val placeholder = placeholderUris.remove(job.id)
             if (placeholder != null) ProcessingAlbumBridge.removePlaceholder(context, placeholder)
+            val savedUri = job.dngUri
             if (
                 job.stage == LightningJobStage.SAVED &&
-                job.dngUri != null &&
+                savedUri != null &&
                 orientationFixed[job.id] != true
             ) {
                 val orientation = jobOrientations[job.id]
                 if (orientation != null) {
                     ProcessingAlbumBridge.fixDngOrientation(
                         context = context,
-                        uri = job.dngUri,
+                        uri = savedUri,
                         cameraId = orientation.first,
                         displayRotationDegrees = orientation.second,
                     )
