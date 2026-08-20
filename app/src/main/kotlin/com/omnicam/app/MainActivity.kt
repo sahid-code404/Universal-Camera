@@ -7,7 +7,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
-import com.omnicam.feature.camera.LightningCameraRoute
+import com.omnicam.feature.camera.CameraLabHost
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -16,7 +16,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             OmniCamTheme {
                 val container = (application as OmniCamApplication).appContainer
-                LightningCameraRoute(
+                CameraLabHost(
                     scanner = container.cameraCapabilityScanner,
                     controller = container.lightningRawController,
                 )
