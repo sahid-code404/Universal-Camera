@@ -103,17 +103,21 @@ data class LightningRawJobStatus(
 }
 
 /**
- * Camera2 controller that sends the live stream straight to a hardware/compositor Surface while
- * keeping RAW_SENSOR capture in the same session. No JPEG/YUV bitmap preview is produced here.
+ * Camera2 controller with a clean processed Surface preview and native RAW_SENSOR capture.
  *
- * The Surface is supplied by androidx.camera.viewfinder in the UI. That library owns rotation,
- * mirroring, aspect-ratio scaling and SurfaceView/TextureView fallback while this controller keeps
- * full Camera2 access for RAW, flash, zoom and 3A.
+ * The important separation here is intentional: while the user is composing, the active camera
+ * session contains ONLY the PRIVATE preview Surface. The RAW surface is configured only after the
+ * shutter is pressed, then removed again immediately after the burst. Several Qualcomm/Xiaomi HALs
+ * change sensor timing / ISP behaviour as soon as a large RAW stream is part of the live session;
+ * that can make an otherwise good SurfaceView preview look bright, low-shutter, grainy and washed.
+ *
+ * This preview-only session mirrors the Preview Lab SURFACE path that was validated on-device. The
+ * UI still uses androidx.camera.viewfinder for rotation, crop, mirroring and tap-coordinate mapping.
  */
 class LightningRawController(context: Context) {
     private val appContext = context.applicationContext
     private val cameraManager = appContext.getSystemService(CameraManager::class.java)
-    private val cameraThread = HandlerThread("OmniCam-Surface-Camera").apply { start() }
+    private val cameraThread = HandlerThread("OmniCam-CleanPreview-Camera").apply { start() }
     private val imageThread = HandlerThread("OmniCam-Raw-Copy").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
     private val imageHandler = Handler(imageThread.looper)
@@ -138,8 +142,7 @@ class LightningRawController(context: Context) {
     private val _cameraState = MutableStateFlow(LightningCameraState())
     val cameraState: StateFlow<LightningCameraState> = _cameraState.asStateFlow()
 
-    // Kept for source compatibility with the previous screen. Direct Surface preview deliberately
-    // never emits a bitmap frame.
+    // Source compatibility with the older bitmap-preview screen. Surface preview emits no bitmap.
     private val _previewFrame = MutableStateFlow<JpegPreviewFrame?>(null)
     val previewFrame: StateFlow<JpegPreviewFrame?> = _previewFrame.asStateFlow()
 
@@ -156,6 +159,7 @@ class LightningRawController(context: Context) {
     private var activeCandidate: RawCandidate? = null
     private var activeSpec: ComputationalRawViewfinderSpec? = null
     private var requestedFlashMode = LightningFlashMode.OFF
+    private var rawSessionActive = false
 
     @Volatile
     private var latestPreviewResult: TotalCaptureResult? = null
@@ -194,10 +198,7 @@ class LightningRawController(context: Context) {
         )
     }
 
-    /**
-     * Legacy entry point retained so old experimental UI still compiles. The production screen uses
-     * [bindSurface] because the viewfinder owns the Surface lifecycle.
-     */
+    /** Legacy entry point retained for the old experimental screen. */
     suspend fun bind(
         spec: ComputationalRawViewfinderSpec,
         route: ValuableCameraRoute,
@@ -217,10 +218,16 @@ class LightningRawController(context: Context) {
     ): ComputationalRawBindResult = withContext(Dispatchers.Main.immediate) {
         closeCurrent()
         if (!surface.isValid) {
-            return@withContext ComputationalRawBindResult.Failure(route.camera.id, "Preview Surface is not valid")
+            return@withContext ComputationalRawBindResult.Failure(
+                route.camera.id,
+                "Preview Surface is not valid",
+            )
         }
         if (route.access != CameraRouteAccess.DIRECT_CAMERA_DEVICE || !route.camera.rawSupported) {
-            return@withContext ComputationalRawBindResult.Failure(route.camera.id, "Direct RAW_SENSOR route required")
+            return@withContext ComputationalRawBindResult.Failure(
+                route.camera.id,
+                "Direct RAW_SENSOR route required",
+            )
         }
 
         val chars = runCatching { cameraManager.getCameraCharacteristics(route.camera.id) }
@@ -235,20 +242,18 @@ class LightningRawController(context: Context) {
             return@withContext ComputationalRawBindResult.Failure(route.camera.id, "No RAW_SENSOR size")
         }
 
-        var last: Throwable? = null
-        for (candidate in candidates) {
+        // Preview session no longer depends on a RAW stream combination, but we still choose the RAW
+        // candidate now so the shutter path has a ready ImageReader and native dimensions.
+        val candidate = candidates.first()
+        return@withContext runCatching {
+            bindAttempt(spec, route, chars, candidate, surface)
+        }.getOrElse {
             closeCurrent()
-            if (!surface.isValid) {
-                return@withContext ComputationalRawBindResult.Failure(route.camera.id, "Preview Surface was released")
-            }
-            val attempt = runCatching { bindAttempt(spec, route, chars, candidate, surface) }
-            attempt.onSuccess { return@withContext it }
-            last = attempt.exceptionOrNull()
+            ComputationalRawBindResult.Failure(
+                route.camera.id,
+                it.message ?: "Clean Surface preview session rejected",
+            )
         }
-        ComputationalRawBindResult.Failure(
-            route.camera.id,
-            last?.message ?: "Surface preview + RAW session rejected",
-        )
     }
 
     @SuppressLint("MissingPermission")
@@ -272,10 +277,17 @@ class LightningRawController(context: Context) {
         activeCandidate = candidate
         activeSpec = spec
         latestPreviewResult = null
+        rawSessionActive = false
 
         val device = openCamera(route.camera.id)
         cameraDevice = device
-        val session = createSession(device, surface, raw.surface)
+
+        // Deliberately preview-only. RAW is NOT configured into this session.
+        val session = createSession(
+            device = device,
+            surfaces = listOf(surface),
+            label = "preview-only",
+        )
         captureSession = session
 
         val zoom = zoomRange(chars)
@@ -290,11 +302,7 @@ class LightningRawController(context: Context) {
             flashMode = effectiveFlash,
         )
 
-        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-            addTarget(surface)
-            applyProcessedPreviewDefaults(this, chars)
-            applyPreviewFlash(this, chars, effectiveFlash)
-        }
+        val builder = createPreviewBuilder(device, surface, chars, effectiveFlash)
         previewBuilder = builder
         session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler)
 
@@ -304,6 +312,17 @@ class LightningRawController(context: Context) {
             candidate.size.height,
             candidate.maximumResolutionMode,
         )
+    }
+
+    private fun createPreviewBuilder(
+        device: CameraDevice,
+        surface: Surface,
+        chars: CameraCharacteristics,
+        flashMode: LightningFlashMode,
+    ): CaptureRequest.Builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+        addTarget(surface)
+        applyProcessedPreviewDefaults(this, chars)
+        applyPreviewFlash(this, chars, flashMode)
     }
 
     /** Close only if this is still the Surface currently feeding the camera. */
@@ -317,7 +336,10 @@ class LightningRawController(context: Context) {
         val clamped = requested.coerceIn(state.minZoomRatio, state.maxZoomRatio)
         if (abs(clamped - state.zoomRatio) < 0.002f) return state.zoomRatio
         _cameraState.value = state.copy(zoomRatio = clamped)
+        if (rawSessionActive) return clamped
+
         cameraHandler.post {
+            if (rawSessionActive) return@post
             val builder = previewBuilder ?: return@post
             val session = captureSession ?: return@post
             applyZoom(builder, chars, clamped)
@@ -334,7 +356,10 @@ class LightningRawController(context: Context) {
         val effective = if (state.flashAvailable) mode else LightningFlashMode.OFF
         _cameraState.value = state.copy(flashMode = effective)
         val chars = activeCharacteristics ?: return effective
+        if (rawSessionActive) return effective
+
         cameraHandler.post {
+            if (rawSessionActive) return@post
             val builder = previewBuilder ?: return@post
             val session = captureSession ?: return@post
             applyPreviewFlash(builder, chars, effective)
@@ -346,9 +371,8 @@ class LightningRawController(context: Context) {
     }
 
     /**
-     * Focus API for the new transformed viewfinder. [bufferX]/[bufferY] are coordinates returned by
-     * androidx.camera.viewfinder's coordinate transformer, so rotation/mirroring/cropping is already
-     * accounted for.
+     * Focus API for the transformed viewfinder. bufferX/bufferY are coordinates returned by the
+     * viewfinder coordinate transformer, so display rotation/mirroring/cropping is already handled.
      */
     fun focusAtBuffer(
         bufferX: Float,
@@ -358,7 +382,7 @@ class LightningRawController(context: Context) {
         indicatorX: Float,
         indicatorY: Float,
     ): Boolean {
-        if (bufferWidth <= 0 || bufferHeight <= 0) return false
+        if (bufferWidth <= 0 || bufferHeight <= 0 || rawSessionActive) return false
         return focusAtSensorNormalized(
             sensorX = (bufferX / bufferWidth.toFloat()).coerceIn(0f, 1f),
             sensorY = (bufferY / bufferHeight.toFloat()).coerceIn(0f, 1f),
@@ -369,6 +393,7 @@ class LightningRawController(context: Context) {
 
     /** Legacy focus API for the old experimental screen. */
     fun focusAt(normalizedX: Float, normalizedY: Float): Boolean {
+        if (rawSessionActive) return false
         val spec = activeSpec ?: return false
         val sensorPoint = displayToSensor(
             normalizedX.coerceIn(0f, 1f),
@@ -389,6 +414,7 @@ class LightningRawController(context: Context) {
         indicatorX: Float,
         indicatorY: Float,
     ): Boolean {
+        if (rawSessionActive) return false
         val chars = activeCharacteristics ?: return false
         val session = captureSession ?: return false
         val builder = previewBuilder ?: return false
@@ -414,6 +440,7 @@ class LightningRawController(context: Context) {
         )
 
         cameraHandler.post {
+            if (rawSessionActive) return@post
             runCatching {
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                 builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
@@ -446,41 +473,59 @@ class LightningRawController(context: Context) {
         if (!captureMutex.tryLock()) {
             return LightningCaptureResult.Failure("RAW burst already capturing")
         }
-        var temporaryTorch = false
+
+        var capturedBurst: ComputationalRawEngine.CapturedBurst? = null
         try {
             if (activeJobCount() >= MAX_PENDING_JOBS) {
                 return LightningCaptureResult.Failure("Processing queue full")
             }
             activeRoute ?: return LightningCaptureResult.Failure("Camera not ready")
             val device = cameraDevice ?: return LightningCaptureResult.Failure("Camera unavailable")
-            val session = captureSession ?: return LightningCaptureResult.Failure("Session unavailable")
+            val previewSession = captureSession ?: return LightningCaptureResult.Failure("Preview unavailable")
             val reader = rawReader ?: return LightningCaptureResult.Failure("RAW output unavailable")
             val chars = activeCharacteristics ?: return LightningCaptureResult.Failure("Camera metadata unavailable")
             val candidate = activeCandidate ?: return LightningCaptureResult.Failure("RAW size unavailable")
+            val previewSurface = activePreviewSurface
+                ?.takeIf { it.isValid }
+                ?: return LightningCaptureResult.Failure("Preview Surface unavailable")
             val capturedZoom = _cameraState.value.zoomRatio
             val started = android.os.SystemClock.elapsedRealtime()
 
-            return runCatching {
-                val initial = latestPreviewResult ?: awaitReferenceResult(session)
+            return try {
+                // Meter from the clean preview before changing session topology.
+                val initial = latestPreviewResult ?: awaitReferenceResult(previewSession)
                 val flashMode = _cameraState.value.flashMode
                 val flashDuringBurst = shouldIlluminateBurst(flashMode, initial)
                 if (flashDuringBurst && flashMode != LightningFlashMode.TORCH) {
-                    onProgress("Preparing flash")
+                    onProgress("Metering with flash")
                     applyPreviewFlashNow(LightningFlashMode.TORCH)
-                    temporaryTorch = true
                     delay(FLASH_METERING_DELAY_MS)
                 }
 
-                val reference = latestPreviewResult ?: awaitReferenceResult(session)
-                val baseExposure = reference.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: DEFAULT_EXPOSURE_NS
+                val reference = latestPreviewResult ?: awaitReferenceResult(previewSession)
+                val baseExposure = reference.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    ?: DEFAULT_EXPOSURE_NS
                 val baseIso = reference.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
                 val focus = reference.get(CaptureResult.LENS_FOCUS_DISTANCE)
-                onProgress("Capturing ${preset.frameCount} native RAW")
-                runCatching { session.stopRepeating() }
 
+                onProgress("Switching to native RAW")
+                closeSessionOnly()
+                rawSessionActive = true
+
+                // Prefer RAW-only so the large Bayer stream cannot influence normal preview ISP
+                // behaviour. Fall back to RAW+preview configuration only for HALs that reject a
+                // RAW-only session; no repeating preview request is run during that short fallback.
+                val rawSession = createRawCaptureSession(
+                    device = device,
+                    raw = reader.surface,
+                    preview = previewSurface,
+                )
+                captureSession = rawSession
+
+                onProgress("Capturing ${preset.frameCount} native RAW")
                 val burst = engine.captureToScratch(
                     device = device,
-                    session = session,
+                    session = rawSession,
                     reader = reader,
                     characteristics = chars,
                     plan = ComputationalRawEngine.BurstPlan(
@@ -499,7 +544,11 @@ class LightningRawController(context: Context) {
                         )
                         captureBuilder.set(
                             CaptureRequest.FLASH_MODE,
-                            if (flashDuringBurst) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF,
+                            if (flashDuringBurst) {
+                                CaptureRequest.FLASH_MODE_TORCH
+                            } else {
+                                CaptureRequest.FLASH_MODE_OFF
+                            },
                         )
                         applyZoom(captureBuilder, chars, capturedZoom)
                     },
@@ -516,13 +565,12 @@ class LightningRawController(context: Context) {
                         }
                     },
                 )
+                capturedBurst = burst
 
-                if (temporaryTorch) {
-                    applyPreviewFlashNow(requestedFlashMode)
-                    temporaryTorch = false
-                } else {
-                    resumePreview()
-                }
+                closeSessionOnly()
+                rawSessionActive = false
+                onProgress("Restoring preview")
+                restorePreviewSession()
 
                 val captureMillis = android.os.SystemClock.elapsedRealtime() - started
                 val id = idGenerator.incrementAndGet()
@@ -548,8 +596,10 @@ class LightningRawController(context: Context) {
                 if (!queue.trySend(post).isSuccess) {
                     removeJob(id)
                     engine.discardCaptured(burst)
+                    capturedBurst = null
                     error("Processing queue rejected capture")
                 }
+                capturedBurst = null
                 onProgress("DNG processing · shutter ready")
                 LightningCaptureResult.Queued(
                     burst.width,
@@ -557,21 +607,80 @@ class LightningRawController(context: Context) {
                     burst.frameCount,
                     captureMillis,
                 )
-            }.getOrElse { error ->
-                if (temporaryTorch) {
-                    try {
-                        applyPreviewFlashNow(requestedFlashMode)
-                    } catch (_: Throwable) {
-                        resumePreview()
-                    }
-                    temporaryTorch = false
-                } else {
-                    resumePreview()
+            } catch (error: Throwable) {
+                closeSessionOnly()
+                rawSessionActive = false
+                try {
+                    restorePreviewSession()
+                } catch (_: Throwable) {
+                    // Surface/lifecycle may already be leaving; the normal rebind will recover.
                 }
+                capturedBurst?.let { engine.discardCaptured(it) }
+                capturedBurst = null
                 LightningCaptureResult.Failure(error.message ?: error::class.java.simpleName)
             }
         } finally {
             captureMutex.unlock()
+        }
+    }
+
+    private suspend fun restorePreviewSession() {
+        val device = cameraDevice ?: error("Camera unavailable while restoring preview")
+        val surface = activePreviewSurface
+            ?.takeIf { it.isValid }
+            ?: error("Preview Surface unavailable while restoring")
+        val chars = activeCharacteristics ?: error("Camera metadata unavailable while restoring")
+        val effectiveFlash = if (_cameraState.value.flashAvailable) {
+            requestedFlashMode
+        } else {
+            LightningFlashMode.OFF
+        }
+
+        closeSessionOnly()
+        val session = createSession(
+            device = device,
+            surfaces = listOf(surface),
+            label = "preview-only restore",
+        )
+        captureSession = session
+
+        // Recreate rather than reuse so no temporary AF trigger/region or flash metering state leaks
+        // from the pre-capture request into the normal preview.
+        val builder = createPreviewBuilder(device, surface, chars, effectiveFlash)
+        applyZoom(builder, chars, _cameraState.value.zoomRatio)
+        previewBuilder = builder
+        latestPreviewResult = null
+        session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler)
+    }
+
+    private suspend fun createRawCaptureSession(
+        device: CameraDevice,
+        raw: Surface,
+        preview: Surface,
+    ): CameraCaptureSession {
+        var rawOnlyFailure: Throwable? = null
+        try {
+            return createSession(
+                device = device,
+                surfaces = listOf(raw),
+                label = "RAW-only",
+            )
+        } catch (error: Throwable) {
+            rawOnlyFailure = error
+        }
+
+        if (!preview.isValid) throw rawOnlyFailure
+            ?: IllegalStateException("RAW-only session failed and preview Surface is invalid")
+
+        return try {
+            createSession(
+                device = device,
+                surfaces = listOf(preview, raw),
+                label = "RAW+preview capture fallback",
+            )
+        } catch (comboError: Throwable) {
+            rawOnlyFailure?.let(comboError::addSuppressed)
+            throw comboError
         }
     }
 
@@ -647,17 +756,29 @@ class LightningRawController(context: Context) {
         chars: CameraCharacteristics,
     ) {
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CaptureRequest.CONTROL_CAPTURE_INTENT_PREVIEW)
+        builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+
         if (chars.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true) {
             builder.set(CaptureRequest.CONTROL_AE_LOCK, false)
         }
         if (chars.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true) {
             builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
         }
+        chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)?.let { range ->
+            if (range.contains(0)) {
+                builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0)
+            }
+        }
+
+        // Match the Preview Lab Surface path: 30/30 first. The previous production preference for
+        // 10/30 or 15/30 allowed long preview exposures that looked washed and smeared on-device.
         choosePreviewFps(chars)?.let {
             builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
         }
+
         val antibanding = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES).orEmpty()
         if (antibanding.contains(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO)) {
             builder.set(
@@ -665,6 +786,9 @@ class LightningRawController(context: Context) {
                 CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO,
             )
         }
+
+        // These are the same realtime ISP modes used by the Surface Preview Lab path that tested
+        // well on the device. Do not perform any app-side YUV/JPEG conversion.
         val toneModes = chars.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES).orEmpty()
         if (toneModes.contains(CaptureRequest.TONEMAP_MODE_FAST)) {
             builder.set(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_FAST)
@@ -673,7 +797,6 @@ class LightningRawController(context: Context) {
         when {
             nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_FAST) ->
                 builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
-
             nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY) ->
                 builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
         }
@@ -681,10 +804,10 @@ class LightningRawController(context: Context) {
         when {
             edgeModes.contains(CaptureRequest.EDGE_MODE_FAST) ->
                 builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
-
             edgeModes.contains(CaptureRequest.EDGE_MODE_HIGH_QUALITY) ->
                 builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
         }
+
         setContinuousAfIfSupported(builder, chars)
         applyZoom(builder, chars, _cameraState.value.zoomRatio)
     }
@@ -706,7 +829,6 @@ class LightningRawController(context: Context) {
                 builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
             }
-
             LightningFlashMode.AUTO -> {
                 builder.set(
                     CaptureRequest.CONTROL_AE_MODE,
@@ -718,14 +840,11 @@ class LightningRawController(context: Context) {
                 )
                 builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
             }
-
             LightningFlashMode.ON -> {
-                // Keep preview illumination off; capture() enables torch across the RAW burst so every
-                // Bayer frame receives light instead of only a single processed still frame.
+                // Capture() meters briefly with torch and illuminates every RAW frame in the burst.
                 builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
             }
-
             LightningFlashMode.TORCH -> {
                 builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
@@ -734,10 +853,15 @@ class LightningRawController(context: Context) {
     }
 
     private suspend fun applyPreviewFlashNow(mode: LightningFlashMode) {
+        if (rawSessionActive) return
         val chars = activeCharacteristics ?: return
         val effective = if (_cameraState.value.flashAvailable) mode else LightningFlashMode.OFF
         suspendCancellableCoroutine { continuation ->
             cameraHandler.post {
+                if (rawSessionActive) {
+                    if (continuation.isActive) continuation.resume(Unit)
+                    return@post
+                }
                 val builder = previewBuilder
                 val session = captureSession
                 if (builder == null || session == null) {
@@ -775,9 +899,8 @@ class LightningRawController(context: Context) {
 
     private fun choosePreviewFps(chars: CameraCharacteristics): Range<Int>? {
         val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
-        return ranges.firstOrNull { it.lower <= 15 && it.upper == 30 && it.lower >= 10 }
-            ?: ranges.firstOrNull { it.lower <= 24 && it.upper == 30 }
-            ?: ranges.firstOrNull { it.lower == 30 && it.upper == 30 }
+        return ranges.firstOrNull { it.lower == 30 && it.upper == 30 }
+            ?: ranges.filter { it.upper == 30 }.maxByOrNull { it.lower }
             ?: ranges.filter { it.upper >= 30 }
                 .minWithOrNull(
                     compareBy<Range<Int>> { abs(it.upper - 30) }
@@ -844,6 +967,7 @@ class LightningRawController(context: Context) {
             request: CaptureRequest,
             result: TotalCaptureResult,
         ) {
+            if (rawSessionActive) return
             latestPreviewResult = result
             val focus = _focusState.value
             if (focus.status == LightningFocusStatus.SCANNING) {
@@ -860,7 +984,7 @@ class LightningRawController(context: Context) {
     }
 
     private fun restoreContinuousFocus(generation: Long) {
-        if (focusGeneration.get() != generation) return
+        if (focusGeneration.get() != generation || rawSessionActive) return
         val chars = activeCharacteristics ?: return
         val builder = previewBuilder ?: return
         val session = captureSession ?: return
@@ -876,7 +1000,7 @@ class LightningRawController(context: Context) {
             _focusState.value = state.copy(status = LightningFocusStatus.FAILED)
         }
         cameraHandler.postDelayed({
-            if (focusGeneration.get() == generation) {
+            if (focusGeneration.get() == generation && !rawSessionActive) {
                 _focusState.value = LightningFocusState()
             }
         }, FOCUS_INDICATOR_HOLD_MS)
@@ -934,13 +1058,43 @@ class LightningRawController(context: Context) {
         }
     }
 
-    private fun resumePreview() {
-        val session = captureSession ?: return
-        val builder = previewBuilder ?: return
-        cameraHandler.post {
-            runCatching {
-                session.setRepeatingRequest(builder.build(), previewCaptureCallback, cameraHandler)
+    private fun closeSessionOnly() {
+        val session = captureSession
+        captureSession = null
+        runCatching { session?.stopRepeating() }
+        runCatching { session?.abortCaptures() }
+        runCatching { session?.close() }
+    }
+
+    private suspend fun createSession(
+        device: CameraDevice,
+        surfaces: List<Surface>,
+        label: String,
+    ): CameraCaptureSession = suspendCancellableCoroutine { continuation ->
+        @Suppress("DEPRECATION")
+        val callback = object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(session: CameraCaptureSession) {
+                if (continuation.isActive) {
+                    continuation.resume(session)
+                } else {
+                    session.close()
+                }
             }
+
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+                session.close()
+                if (continuation.isActive) {
+                    continuation.resumeWithException(
+                        IllegalStateException("$label camera session rejected"),
+                    )
+                }
+            }
+        }
+        @Suppress("DEPRECATION")
+        runCatching {
+            device.createCaptureSession(surfaces, callback, cameraHandler)
+        }.onFailure {
+            if (continuation.isActive) continuation.resumeWithException(it)
         }
     }
 
@@ -970,7 +1124,7 @@ class LightningRawController(context: Context) {
                 merged = merged,
                 transformed = transformed,
                 thumbnail = null,
-                description = "OmniCam Surface RAW ${job.preset.name}; " +
+                description = "OmniCam CleanPreview RAW ${job.preset.name}; " +
                     "zoom=${String.format(Locale.US, "%.2f", job.zoomRatio)}x; " +
                     "upscale=${String.format(Locale.US, "%.2f", transformed.scale)}x; " +
                     "crop=${transformed.cropLeft},${transformed.cropTop}",
@@ -1062,8 +1216,9 @@ class LightningRawController(context: Context) {
     }
 
     /**
-     * PRIVATE/Surface preview sizes. Unlike the removed JPEG preview, these are designed by the HAL
-     * for continuous low-latency streaming and do not incur JPEG stall duration.
+     * Match Preview Lab's validated Surface size policy rather than selecting a heavier 1080p-class
+     * buffer by default. Aspect matching is still first priority; around 1280 on the long edge keeps
+     * the realtime ISP path low-latency and leaves headroom for AE/NR processing.
      */
     private fun choosePreviewSize(
         chars: CameraCharacteristics,
@@ -1082,30 +1237,19 @@ class LightningRawController(context: Context) {
             ?: 4f / 3f
 
         val bounded = sizes.filter {
-            max(it.width, it.height) <= 1920 &&
-                min(it.width, it.height) >= 720 &&
-                pixels(it) <= 2_500_000L
+            max(it.width, it.height) <= 1440 && pixels(it) <= 1_800_000L
         }.ifEmpty {
-            sizes.filter { pixels(it) <= 3_500_000L }.ifEmpty { sizes.toList() }
-        }
+            sizes.filter { max(it.width, it.height) <= 1920 }
+        }.ifEmpty { sizes.toList() }
 
         return bounded.minWithOrNull(
             compareBy<Size> {
                 abs(it.width.toFloat() / it.height.toFloat() - aspect)
             }.thenBy {
-                privateFrameCost(map, it)
-            }.thenBy {
-                abs(pixels(it) - TARGET_PREVIEW_PIXELS)
-            },
-        ) ?: sizes.minBy(::pixels)
+                abs(max(it.width, it.height) - 1280)
+            }.thenByDescending(::pixels),
+        ) ?: sizes.first()
     }
-
-    private fun privateFrameCost(
-        map: android.hardware.camera2.params.StreamConfigurationMap,
-        size: Size,
-    ): Long = runCatching {
-        map.getOutputMinFrameDuration(SurfaceTexture::class.java, size)
-    }.getOrDefault(0L).coerceAtLeast(0L)
 
     private fun setContinuousAfIfSupported(
         builder: CaptureRequest.Builder,
@@ -1118,10 +1262,13 @@ class LightningRawController(context: Context) {
                     CaptureRequest.CONTROL_AF_MODE,
                     CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
                 )
-
+            modes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) ->
+                builder.set(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+                )
             modes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) ->
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-
             else -> builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
         }
     }
@@ -1166,45 +1313,12 @@ class LightningRawController(context: Context) {
             }
         }
 
-    @Suppress("DEPRECATION")
-    private suspend fun createSession(
-        device: CameraDevice,
-        preview: Surface,
-        raw: Surface,
-    ): CameraCaptureSession = suspendCancellableCoroutine { continuation ->
-        val callback = object : CameraCaptureSession.StateCallback() {
-            override fun onConfigured(session: CameraCaptureSession) {
-                if (continuation.isActive) {
-                    continuation.resume(session)
-                } else {
-                    session.close()
-                }
-            }
-
-            override fun onConfigureFailed(session: CameraCaptureSession) {
-                session.close()
-                if (continuation.isActive) {
-                    continuation.resumeWithException(
-                        IllegalStateException("Surface preview + RAW session rejected"),
-                    )
-                }
-            }
-        }
-        runCatching {
-            device.createCaptureSession(listOf(preview, raw), callback, cameraHandler)
-        }.onFailure {
-            if (continuation.isActive) continuation.resumeWithException(it)
-        }
-    }
-
     private fun closeCurrent() {
         focusGeneration.incrementAndGet()
-        runCatching { captureSession?.stopRepeating() }
-        runCatching { captureSession?.abortCaptures() }
-        runCatching { captureSession?.close() }
+        rawSessionActive = false
+        closeSessionOnly()
         runCatching { cameraDevice?.close() }
         runCatching { rawReader?.close() }
-        captureSession = null
         cameraDevice = null
         rawReader = null
         previewBuilder = null
@@ -1246,6 +1360,5 @@ class LightningRawController(context: Context) {
         const val FOCUS_TIMEOUT_MS = 1_600L
         const val FOCUS_INDICATOR_HOLD_MS = 700L
         const val REFERENCE_RESULT_TIMEOUT_MS = 1_500L
-        const val TARGET_PREVIEW_PIXELS = 2_073_600L
     }
 }
