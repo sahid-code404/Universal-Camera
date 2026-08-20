@@ -130,7 +130,6 @@ fun LiquidCameraRoute(
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
     }
     var pendingCaptureOrientation by remember { mutableStateOf<Pair<String, Int>?>(null) }
-    val placeholderUris = remember { mutableStateMapOf<Long, android.net.Uri>() }
     val jobOrientations = remember { mutableStateMapOf<Long, Pair<String, Int>>() }
     val orientationFixed = remember { mutableStateMapOf<Long, Boolean>() }
 
@@ -207,17 +206,22 @@ fun LiquidCameraRoute(
     val lensFactor = selected?.let { liquidEquivalentFocal(it) / baseEq } ?: 1f
     val displayZoom = lensFactor * cameraState.zoomRatio
     val queueFull = jobs.count { !it.terminal } >= 3
+    val processing = jobs.any { !it.terminal }
     val lastSaved = jobs.firstOrNull { it.stage == LightningJobStage.SAVED && it.dngUri != null }
     val displayRotation = liquidRotationDegrees(view.display?.rotation ?: AndroidSurface.ROTATION_0)
 
-    val spec = remember(selectedId, aspect, displayRotation) {
+    // Keep one sensor-native processed preview stream per lens/rotation. Aspect selection is now a
+    // composition crop only and never tears down/reconfigures the Camera2 session. This fixes the
+    // main-camera 4:3 freeze and prevents 1:1 from selecting an unusual low-resolution square-ish
+    // stream. Final DNG aspect is still applied by RawDngTransform at capture time.
+    val spec = remember(selectedId, displayRotation) {
         selected?.let { route ->
             runCatching {
                 controller.createViewfinderSpec(
                     route = route,
-                    targetAspect = aspect.ratio,
+                    targetAspect = null,
                     displayRotationDegrees = displayRotation,
-                    sessionKey = "liquid-${route.camera.id}-${aspect.name}-$displayRotation",
+                    sessionKey = "liquid-${route.camera.id}-stable-$displayRotation",
                 )
             }.onFailure {
                 bindResult = ComputationalRawBindResult.Failure(
@@ -228,7 +232,7 @@ fun LiquidCameraRoute(
         }
     }
 
-    LaunchedEffect(selectedId, aspect, previewBackend, resumed) {
+    LaunchedEffect(selectedId, previewBackend, resumed) {
         bindResult = null
         controller.unbind()
     }
@@ -240,16 +244,9 @@ fun LiquidCameraRoute(
                 jobOrientations[active.id] = orientation
                 pendingCaptureOrientation = null
             }
-            if (!placeholderUris.containsKey(active.id)) {
-                ProcessingAlbumBridge.createPlaceholder(context, active.id)?.let {
-                    placeholderUris[active.id] = it
-                }
-            }
         }
 
         jobs.filter { it.terminal }.forEach { job ->
-            val placeholder = placeholderUris.remove(job.id)
-            if (placeholder != null) ProcessingAlbumBridge.removePlaceholder(context, placeholder)
             val savedUri = job.dngUri
             if (
                 job.stage == LightningJobStage.SAVED &&
@@ -360,6 +357,7 @@ fun LiquidCameraRoute(
                     displayZoom = displayZoom,
                     message = if (queueFull) "Processing queue full" else message,
                     capturing = capturing,
+                    processing = capturing || processing,
                     captureEnabled = !capturing && !queueFull && bindResult is ComputationalRawBindResult.Success,
                     hasSavedPhoto = lastSaved?.dngUri != null,
                     canFlip = routes.any { it.camera.lensFacing != selected?.camera?.lensFacing },
@@ -466,9 +464,8 @@ private fun LiquidPreview(
     }
 
     Box(modifier.background(Color.Black), contentAlignment = Alignment.Center) {
-        // iPhone-style composition behavior: the selected photo aspect is the real visible frame.
-        // The viewfinder is no longer stretched to the whole display and then cropped differently at
-        // save time. What is inside this box is what the DNG transform keeps.
+        // The camera buffer remains stable and high quality. Only this visible composition window
+        // changes size, exactly like a crop guide; Camera2 is not reopened when 4:3/16:9/1:1 changes.
         val frame = if (aspect.ratio == null) {
             Modifier.fillMaxSize()
         } else {
@@ -596,6 +593,7 @@ private fun LiquidCaptureArea(
     displayZoom: Float,
     message: String,
     capturing: Boolean,
+    processing: Boolean,
     captureEnabled: Boolean,
     hasSavedPhoto: Boolean,
     canFlip: Boolean,
@@ -629,7 +627,6 @@ private fun LiquidCaptureArea(
             maxLines = 1,
             modifier = Modifier.padding(top = 7.dp),
         )
-        // Bottom no longer duplicates QUALITY/HDR/MAX. This camera has one still-photo mode.
         Text(
             "PHOTO",
             color = Color.White,
@@ -643,10 +640,9 @@ private fun LiquidCaptureArea(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            GlassCircleButton(
-                text = if (hasSavedPhoto) "IMG" else "—",
+            LiquidGalleryButton(
                 enabled = hasSavedPhoto,
-                sizeDp = 54,
+                processing = processing,
                 onClick = onGallery,
             )
             LiquidShutter(captureEnabled, capturing, onCapture)
@@ -731,7 +727,7 @@ private fun LiquidAdvancedDrawer(
                 onValue = onHighlight,
             )
             Text(
-                "Final output is DNG only · processing placeholder is temporary",
+                "Final output is DNG only · album ring shows background processing",
                 color = Color.White.copy(alpha = 0.48f),
                 fontSize = 9.sp,
                 textAlign = TextAlign.Center,
