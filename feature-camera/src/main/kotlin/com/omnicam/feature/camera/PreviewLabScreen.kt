@@ -28,8 +28,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -99,7 +97,12 @@ fun CameraLabHost(
                 shape = CircleShape,
                 color = Color.Black.copy(alpha = 0.62f),
             ) {
-                Text("PREVIEW LAB", color = Color.White, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp))
+                Text(
+                    "PREVIEW LAB",
+                    color = Color.White,
+                    fontSize = 10.sp,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                )
             }
         }
     }
@@ -172,9 +175,15 @@ fun PreviewLabRoute(
         else -> null
     }
     val spec = remember(selectedId, camera2Mode, displayRotation) {
-        if (selectedId == null || camera2Mode == null) null else runCatching {
-            controller.createSpec(selectedId!!, camera2Mode, 4f / 3f, displayRotation)
-        }.onFailure { bindError = it.message ?: "Could not create preview spec" }.getOrNull()
+        if (selectedId == null || camera2Mode == null) {
+            null
+        } else {
+            runCatching {
+                controller.createSpec(selectedId!!, camera2Mode, 4f / 3f, displayRotation)
+            }.onFailure {
+                bindError = it.message ?: "Could not create preview spec"
+            }.getOrNull()
+        }
     }
 
     LaunchedEffect(choice, selectedId) {
@@ -197,7 +206,12 @@ fun PreviewLabRoute(
                 shape = CircleShape,
                 color = Color.White.copy(alpha = 0.15f),
             ) {
-                Text("FULL CAMERA", color = Color.White, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+                Text(
+                    "FULL CAMERA",
+                    color = Color.White,
+                    fontSize = 10.sp,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                )
             }
         }
 
@@ -206,22 +220,18 @@ fun PreviewLabRoute(
                 !permissionGranted -> LabMessage("Camera permission required")
                 scanError != null -> LabMessage(scanError.orEmpty())
                 selected == null -> LabMessage("No direct camera found")
-                choice == PreviewLabChoice.CAMERAX_SURFACE -> {
-                    controller.unbind()
+                choice == PreviewLabChoice.CAMERAX_SURFACE ->
                     CameraXPreviewPane(
                         lensFacing = selected.camera.lensFacing,
                         implementation = PreviewView.ImplementationMode.PERFORMANCE,
                         onError = { bindError = it },
                     )
-                }
-                choice == PreviewLabChoice.CAMERAX_TEXTURE -> {
-                    controller.unbind()
+                choice == PreviewLabChoice.CAMERAX_TEXTURE ->
                     CameraXPreviewPane(
                         lensFacing = selected.camera.lensFacing,
                         implementation = PreviewView.ImplementationMode.COMPATIBLE,
                         onError = { bindError = it },
                     )
-                }
                 spec != null && camera2Mode == PreviewLabMode.TEXTURE_PRIVATE ->
                     TexturePrivatePane(controller, spec, onError = { bindError = it })
                 spec != null && camera2Mode == PreviewLabMode.SURFACE_PRIVATE ->
@@ -232,12 +242,26 @@ fun PreviewLabRoute(
             }
 
             Column(
-                Modifier.align(Alignment.TopStart).padding(10.dp).background(Color.Black.copy(alpha = 0.56f), RoundedCornerShape(12.dp)).padding(10.dp),
+                Modifier
+                    .align(Alignment.TopStart)
+                    .padding(10.dp)
+                    .background(Color.Black.copy(alpha = 0.56f), RoundedCornerShape(12.dp))
+                    .padding(10.dp),
             ) {
-                val sizeText = state.size?.let { "${it.width}×${it.height}" } ?: spec?.size?.let { "${it.width}×${it.height}" } ?: "auto"
+                val sizeText = state.size?.let { "${it.width}×${it.height}" }
+                    ?: spec?.size?.let { "${it.width}×${it.height}" }
+                    ?: "auto"
                 Text(choice.label, color = Color.White, fontSize = 12.sp)
-                Text("$sizeText  ${String.format(Locale.US, "%.1f", state.fps)} fps", color = Color.White.copy(alpha = 0.72f), fontSize = 10.sp)
-                Text(bindError ?: state.status, color = if (bindError == null) Color.White.copy(alpha = 0.62f) else Color(0xFFFF6961), fontSize = 9.sp)
+                Text(
+                    "$sizeText  ${String.format(Locale.US, "%.1f", state.fps)} fps",
+                    color = Color.White.copy(alpha = 0.72f),
+                    fontSize = 10.sp,
+                )
+                Text(
+                    bindError ?: state.status,
+                    color = if (bindError == null) Color.White.copy(alpha = 0.62f) else Color(0xFFFF6961),
+                    fontSize = 9.sp,
+                )
             }
         }
 
@@ -306,10 +330,12 @@ private fun TexturePrivatePane(
     }
     Box(Modifier.fillMaxWidth().aspectRatio(0.75f).background(Color.Black), contentAlignment = Alignment.Center) {
         AndroidView(
-            modifier = Modifier.fillMaxSize().graphicsLayer(
-                rotationZ = spec.rotationDegrees.toFloat(),
-                scaleX = if (spec.mirrorX) -1f else 1f,
-            ),
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer(
+                    rotationZ = spec.rotationDegrees.toFloat(),
+                    scaleX = if (spec.mirrorX) -1f else 1f,
+                ),
             factory = { context ->
                 TextureView(context).apply {
                     surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -320,6 +346,7 @@ private fun TexturePrivatePane(
 
                         override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
                         override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+
                         override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
                             controller.unbind()
                             previewSurface?.release()
@@ -347,10 +374,12 @@ private fun SurfacePrivatePane(
     }
     Box(Modifier.fillMaxWidth().aspectRatio(0.75f).background(Color.Black), contentAlignment = Alignment.Center) {
         AndroidView(
-            modifier = Modifier.fillMaxSize().graphicsLayer(
-                rotationZ = spec.rotationDegrees.toFloat(),
-                scaleX = if (spec.mirrorX) -1f else 1f,
-            ),
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer(
+                    rotationZ = spec.rotationDegrees.toFloat(),
+                    scaleX = if (spec.mirrorX) -1f else 1f,
+                ),
             factory = { context ->
                 SurfaceView(context).apply {
                     holder.addCallback(object : SurfaceHolder.Callback {
@@ -426,7 +455,9 @@ private fun CameraXPreviewPane(
                         else CameraSelector.LENS_FACING_BACK,
                     )
                     .build()
-                val preview = Preview.Builder().build().also { it.surfaceProvider = view.surfaceProvider }
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(view.surfaceProvider)
+                }
                 cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview)
             }.onFailure { onError(it.message ?: "CameraX bind failed") }
         }
@@ -443,9 +474,9 @@ private fun CameraXPreviewPane(
                     previewView = this
                 }
             },
-            update = { view ->
-                view.implementationMode = implementation
-                previewView = view
+            update = { preview ->
+                preview.implementationMode = implementation
+                previewView = preview
             },
         )
     }
