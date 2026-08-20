@@ -2,7 +2,7 @@ name: Android CI
 
 on:
   push:
-    branches: [main, phase-0-1-foundation, experiment-snapcam-aux-identity, phase-2-camera-ui-updater, phase-2-camera-ui-dng-only, phase-2-yuv-dng-camera-ui]
+    branches: [main, phase-0-1-foundation, experiment-snapcam-aux-identity, phase-2-camera-ui-updater, phase-2-camera-ui-dng-only, phase-2-yuv-dng-camera-ui, phase-2-preview-lab-all-methods]
   pull_request:
     branches: [main, phase-0-1-foundation, phase-2-camera-ui-dng-only]
 
