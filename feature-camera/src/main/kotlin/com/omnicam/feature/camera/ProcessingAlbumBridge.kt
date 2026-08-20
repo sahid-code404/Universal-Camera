@@ -3,81 +3,101 @@ package com.omnicam.feature.camera
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.provider.MediaStore
 import java.io.RandomAccessFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Makes a just-shot photo visible in the system gallery immediately while the real RAW fusion is
- * still running. Android has no public cross-gallery equivalent of iPhone Photos' private
- * "Processing" state, so OmniCam publishes a temporary visible card in the fixed OmniCam album and
- * removes it as soon as the final DNG is ready. The final file remains RAW/DNG only.
+ * Gallery integration plus DNG orientation repair.
+ *
+ * OmniCam does not publish temporary JPEG processing cards anymore. RAW processing progress belongs
+ * in the camera UI, while the final DNG is written directly into DCIM/OmniCam by the camera layer.
  */
 internal object ProcessingAlbumBridge {
-    suspend fun createPlaceholder(context: Context, id: Long): Uri? = withContext(Dispatchers.IO) {
-        val resolver = context.contentResolver
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, "OMNI_PROCESSING_$id.jpg")
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.WIDTH, 720)
-            put(MediaStore.Images.Media.HEIGHT, 540)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/OmniCam")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
-        }
-        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return@withContext null
-        try {
-            val bitmap = Bitmap.createBitmap(720, 540, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bitmap)
-            canvas.drawColor(Color.rgb(20, 20, 22))
-            val title = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.WHITE
-                textAlign = Paint.Align.CENTER
-                textSize = 46f
-                typeface = android.graphics.Typeface.DEFAULT_BOLD
-            }
-            val sub = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(185, 185, 190)
-                textAlign = Paint.Align.CENTER
-                textSize = 27f
-            }
-            canvas.drawText("Processing RAW…", 360f, 255f, title)
-            canvas.drawText("OmniCam · final DNG is being prepared", 360f, 310f, sub)
-            resolver.openOutputStream(uri, "w")?.use {
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 92, it)
-            }
-            bitmap.recycle()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
-            }
-            uri
-        } catch (error: Throwable) {
-            resolver.delete(uri, null, null)
-            null
-        }
-    }
+    private const val APP_GALLERY_CATEGORY = "android.intent.category.APP_GALLERY"
 
-    suspend fun removePlaceholder(context: Context, uri: Uri?) = withContext(Dispatchers.IO) {
-        if (uri != null) runCatching { context.contentResolver.delete(uri, null, null) }
-    }
-
+    /**
+     * Open a real gallery application directly instead of sending every tap through Android's app
+     * chooser. We prefer the device vendor gallery, then Google Photos, and finally fall back to the
+     * platform gallery selector. This keeps the album button deterministic on Xiaomi/Poco, Motorola,
+     * Samsung and other common devices without making the user choose an app after every capture.
+     */
     fun openAlbum(context: Context) {
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*")
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+
+        for (packageName in preferredGalleryPackages()) {
+            val galleryIntent = Intent.makeMainSelectorActivity(
+                Intent.ACTION_MAIN,
+                APP_GALLERY_CATEGORY,
+            ).apply {
+                setPackage(packageName)
+                addFlags(flags)
+            }
+            if (runCatching { context.startActivity(galleryIntent) }.isSuccess) return
+
+            val launchIntent = runCatching {
+                context.packageManager.getLaunchIntentForPackage(packageName)
+            }.getOrNull()
+            if (launchIntent != null) {
+                launchIntent.addFlags(flags)
+                if (runCatching { context.startActivity(launchIntent) }.isSuccess) return
+            }
         }
-        runCatching { context.startActivity(intent) }
+
+        val platformGallery = Intent.makeMainSelectorActivity(
+            Intent.ACTION_MAIN,
+            APP_GALLERY_CATEGORY,
+        ).apply { addFlags(flags) }
+        if (runCatching { context.startActivity(platformGallery) }.isSuccess) return
+
+        // Very old / unusual gallery implementations may only advertise image collection viewing.
+        val fallback = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*")
+            addFlags(flags)
+        }
+        runCatching { context.startActivity(fallback) }
+    }
+
+    private fun preferredGalleryPackages(): List<String> {
+        val maker = Build.MANUFACTURER.orEmpty().lowercase()
+        val vendorFirst = when {
+            maker.contains("xiaomi") || maker.contains("poco") || maker.contains("redmi") -> listOf(
+                "com.miui.gallery",
+                "com.google.android.apps.photos",
+            )
+            maker.contains("motorola") -> listOf(
+                "com.motorola.MotGallery2",
+                "com.motorola.gallery",
+                "com.google.android.apps.photos",
+            )
+            maker.contains("samsung") -> listOf(
+                "com.sec.android.gallery3d",
+                "com.google.android.apps.photos",
+            )
+            maker.contains("oneplus") -> listOf(
+                "com.oneplus.gallery",
+                "com.oplus.gallery",
+                "com.google.android.apps.photos",
+            )
+            maker.contains("oppo") || maker.contains("realme") -> listOf(
+                "com.coloros.gallery3d",
+                "com.oplus.gallery",
+                "com.google.android.apps.photos",
+            )
+            else -> listOf("com.google.android.apps.photos")
+        }
+        return (vendorFirst + listOf(
+            "com.google.android.apps.photos",
+            "com.miui.gallery",
+            "com.sec.android.gallery3d",
+            "com.motorola.MotGallery2",
+            "com.android.gallery3d",
+        )).distinct()
     }
 
     suspend fun fixDngOrientation(

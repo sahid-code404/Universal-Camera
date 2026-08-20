@@ -84,6 +84,57 @@ internal fun GlassCircleButton(
     }
 }
 
+/**
+ * Album button that carries RAW-processing feedback inside the camera instead of inserting a fake
+ * image into MediaStore. The outer circular indicator spins until background DNG work completes.
+ */
+@Composable
+internal fun LiquidGalleryButton(
+    enabled: Boolean,
+    processing: Boolean,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier.size(60.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (processing) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(60.dp),
+                color = Color.White.copy(alpha = 0.92f),
+                trackColor = Color.White.copy(alpha = 0.12f),
+                strokeWidth = 2.dp,
+            )
+        }
+        Surface(
+            modifier = Modifier
+                .size(52.dp)
+                .clickable(enabled = enabled, onClick = onClick),
+            shape = CircleShape,
+            color = if (processing) Color.Black.copy(alpha = 0.58f) else LiquidGlass,
+            border = BorderStroke(
+                1.dp,
+                if (processing) Color.White.copy(alpha = 0.44f) else LiquidBorder,
+            ),
+            shadowElevation = 3.dp,
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    text = when {
+                        processing -> "RAW"
+                        enabled -> "IMG"
+                        else -> "—"
+                    },
+                    color = if (processing || enabled) Color.White else Color.White.copy(alpha = 0.32f),
+                    fontSize = 10.sp,
+                    fontWeight = if (processing) FontWeight.Bold else FontWeight.Medium,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+    }
+}
+
 @Composable
 internal fun GlassPillButton(
     text: String,
